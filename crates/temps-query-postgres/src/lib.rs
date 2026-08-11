@@ -68,8 +68,13 @@ fn pg_column_admission(column: &PgQueryColumn, row_budget: usize) -> Option<Stri
         | "time without time zone"
         | "time with time zone"
         | "interval"
+        // information_schema.data_type uses the long names; udt_name / some
+        // drivers surface the short aliases. Admit both so timestamptz cannot
+        // silently become JSON null the way the old NaiveDateTime decoder did.
         | "timestamp without time zone"
         | "timestamp with time zone"
+        | "timestamp"
+        | "timestamptz"
         | "uuid"
         | "money"
         | "inet"
@@ -2442,6 +2447,10 @@ mod wire_budget_tests {
             ("inet", Some("b")),
             ("interval", Some("b")),
             ("time with time zone", Some("b")),
+            ("timestamp with time zone", Some("b")),
+            ("timestamp without time zone", Some("b")),
+            ("timestamptz", Some("b")),
+            ("timestamp", Some("b")),
             ("bit varying", Some("b")),
             ("USER-DEFINED", Some("e")),
         ] {
@@ -3361,6 +3370,18 @@ mod tests {
                  ); \
                  INSERT INTO compatibility_types VALUES (\
                      'ready', '192.0.2.1', interval '1 hour', '12:34:56+00', B'1010'\
+                 ); \
+                 CREATE TABLE stripe_events_shape (\
+                     id text PRIMARY KEY, \
+                     type text NOT NULL, \
+                     received_at timestamptz NOT NULL, \
+                     created_at timestamp NOT NULL\
+                 ); \
+                 INSERT INTO stripe_events_shape VALUES (\
+                     'evt_1U26FiC', \
+                     'customer.subscription.created', \
+                     '2026-08-11 08:47:58.807801+00', \
+                     '2026-08-11 08:47:58.807801'\
                  );",
             )
             .await
@@ -3384,6 +3405,36 @@ mod tests {
             serde_json::json!("192.0.2.1")
         );
         assert_eq!(compatible.rows[0]["flags"], serde_json::json!("1010"));
+
+        // Regression: timestamptz used to decode via NaiveDateTime + .ok() and
+        // become JSON null while the schema still advertised Timestamp.
+        let timestamps = source
+            .query(
+                &ContainerPath::from_slice(&["postgres", "public"]),
+                "stripe_events_shape",
+                None,
+                QueryOptions {
+                    limit: Some(1),
+                    budget,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .expect("timestamptz and timestamp columns must remain browsable");
+        let received_at = timestamps.rows[0]["received_at"]
+            .as_str()
+            .expect("received_at timestamptz must serialize to a JSON string, not null");
+        assert!(
+            received_at.contains("2026-08-11") && received_at.contains("08:47:58"),
+            "received_at should preserve the inserted instant, got {received_at}"
+        );
+        let created_at = timestamps.rows[0]["created_at"]
+            .as_str()
+            .expect("created_at timestamp must serialize to a JSON string, not null");
+        assert!(
+            created_at.contains("2026-08-11") && created_at.contains("08:47:58"),
+            "created_at should preserve the inserted instant, got {created_at}"
+        );
 
         source
             .client
