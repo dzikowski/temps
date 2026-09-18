@@ -1731,6 +1731,7 @@ pub async fn update_git_settings(
             settings.preset_config.clone(),
             settings.git_url.clone(),
             settings.is_public_repo,
+            settings.pull_only_root_directory,
         )
         .await
         .map_err(|e| {

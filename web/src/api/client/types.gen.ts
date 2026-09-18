@@ -15987,6 +15987,10 @@ export type ProjectResponse = {
     deployment_config: DeploymentConfig;
     directory: string;
     /**
+     * When true, deploy clones only `directory` via git sparse-checkout.
+     */
+    pull_only_root_directory: boolean;
+    /**
      * Enable automatic preview environment creation for each branch
      */
     enable_preview_environments: boolean;
@@ -23181,6 +23185,10 @@ export type UpdateFlagRequest = {
 
 export type UpdateGitSettingsRequest = {
     directory: string;
+    /**
+     * When true, deploy clones only `directory`. Ignored when directory is the repo root.
+     */
+    pull_only_root_directory?: boolean | null;
     git_provider_connection_id?: number | null;
     /**
      * Git clone URL for public repositories

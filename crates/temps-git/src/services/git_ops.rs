@@ -6,8 +6,10 @@
 //! Provides safe, typed wrappers around common git operations
 //! to replace raw `Command::new("git")` shell calls.
 
+use base64::Engine;
 use git2::{build::RepoBuilder, Cred, FetchOptions, RemoteCallbacks, Repository};
 use std::path::Path;
+use std::process::Command;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -26,6 +28,13 @@ pub enum GitOpsError {
     CreateBranchFailed {
         branch_name: String,
         repo_path: String,
+        reason: String,
+    },
+
+    #[error("Sparse checkout of '{subdirectory}' from {url} failed: {reason}")]
+    SparseCloneFailed {
+        url: String,
+        subdirectory: String,
         reason: String,
     },
 }
@@ -283,6 +292,145 @@ pub fn create_and_checkout_branch_at(
     create_and_checkout_branch(&repo, branch_name)
 }
 
+/// Normalize and reject unsafe sparse-checkout paths.
+pub fn validate_sparse_subdirectory(subdirectory: &str) -> Result<String, GitOpsError> {
+    let normalized = subdirectory
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .trim_start_matches("./")
+        .to_string();
+    if normalized.is_empty() || normalized == "." {
+        return Err(GitOpsError::SparseCloneFailed {
+            url: String::new(),
+            subdirectory: subdirectory.to_string(),
+            reason: "subdirectory must be a path inside the repository, not the root".to_string(),
+        });
+    }
+    let path = Path::new(&normalized);
+    if normalized.contains('\n')
+        || normalized.contains('\0')
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(GitOpsError::SparseCloneFailed {
+            url: String::new(),
+            subdirectory: subdirectory.to_string(),
+            reason: "subdirectory must be a relative path inside the repository".to_string(),
+        });
+    }
+    Ok(normalized)
+}
+
+/// Clone only `subdirectory` using git sparse-checkout (partial clone).
+///
+/// libgit2 cannot do `--filter=blob:none` + cone sparse-checkout, so this
+/// shells out to `git`. `file://` remotes skip the filter (unsupported).
+///
+/// `credentials` is HTTP Basic (`username`, `token`) via a process-local
+/// `http.extraHeader` — the token is not written into the URL.
+pub fn sparse_clone_repo(
+    url: &str,
+    target_dir: &Path,
+    subdirectory: &str,
+    checkout_ref: Option<&str>,
+    credentials: Option<(&str, &str)>,
+) -> Result<Repository, GitOpsError> {
+    let subdirectory = validate_sparse_subdirectory(subdirectory)?;
+    let redacted_url = temps_core::url_validation::redact_url_password(url);
+    let target = target_dir.display().to_string();
+
+    let fail = |reason: String| GitOpsError::SparseCloneFailed {
+        url: redacted_url.clone(),
+        subdirectory: subdirectory.clone(),
+        reason,
+    };
+
+    let mut clone = Command::new("git");
+    clone
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("clone")
+        .arg("--sparse")
+        .arg("--no-checkout");
+    if !url.starts_with("file:") && !url.starts_with("file://") {
+        clone.arg("--filter=blob:none");
+    }
+    apply_git_http_credentials(&mut clone, credentials);
+    clone.arg(url).arg(target_dir);
+
+    run_git(clone, &format!("clone {redacted_url} into {target}")).map_err(fail)?;
+
+    let mut sparse = Command::new("git");
+    sparse
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-C")
+        .arg(target_dir)
+        .arg("sparse-checkout")
+        .arg("set")
+        .arg("--cone")
+        .arg(&subdirectory);
+    apply_git_http_credentials(&mut sparse, credentials);
+    run_git(sparse, &format!("sparse-checkout set {subdirectory}")).map_err(fail)?;
+
+    let mut checkout = Command::new("git");
+    checkout
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-C")
+        .arg(target_dir)
+        .arg("checkout");
+    if let Some(reference) = checkout_ref.filter(|value| !value.is_empty()) {
+        checkout.arg(reference);
+    }
+    apply_git_http_credentials(&mut checkout, credentials);
+    run_git(
+        checkout,
+        &format!("checkout {}", checkout_ref.unwrap_or("HEAD")),
+    )
+    .map_err(fail)?;
+
+    Repository::open(target_dir).map_err(|e| fail(e.message().to_string()))
+}
+
+fn apply_git_http_credentials(command: &mut Command, credentials: Option<(&str, &str)>) {
+    let Some((username, token)) = credentials else {
+        return;
+    };
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("{username}:{token}"));
+    command
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+        .env(
+            "GIT_CONFIG_VALUE_0",
+            format!("Authorization: Basic {basic}"),
+        );
+}
+
+fn run_git(mut command: Command, action: &str) -> Result<(), String> {
+    let output = command
+        .output()
+        .map_err(|e| format!("failed to run git ({action}): {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("git exited {}", output.status)
+    };
+    Err(format!("{action}: {detail}"))
+}
+
 /// Checkout a specific ref (branch, tag, or commit SHA) in an existing repository.
 ///
 /// For commit SHAs, performs a detached HEAD checkout.
@@ -534,5 +682,57 @@ mod tests {
 
         // file.txt shouldn't exist after checking out the first commit
         assert!(!target_dir.path().join("file.txt").exists());
+    }
+
+    #[test]
+    fn test_validate_sparse_subdirectory_rejects_root_and_escape() {
+        assert!(validate_sparse_subdirectory(".").is_err());
+        assert!(validate_sparse_subdirectory("./").is_err());
+        assert!(validate_sparse_subdirectory("").is_err());
+        assert!(validate_sparse_subdirectory("../etc").is_err());
+        assert_eq!(
+            validate_sparse_subdirectory("./apps/web").unwrap(),
+            "apps/web"
+        );
+        assert_eq!(
+            validate_sparse_subdirectory("apps/web/").unwrap(),
+            "apps/web"
+        );
+    }
+
+    #[test]
+    fn test_sparse_clone_local_repo_keeps_only_subdirectory() {
+        let source_dir = TempDir::new().unwrap();
+        let repo = Repository::init(source_dir.path()).unwrap();
+        let sig = Signature::now("Test", "test@test.com").unwrap();
+
+        std::fs::create_dir_all(source_dir.path().join("apps/web")).unwrap();
+        std::fs::create_dir_all(source_dir.path().join("apps/api")).unwrap();
+        std::fs::write(source_dir.path().join("apps/web/index.html"), "web").unwrap();
+        std::fs::write(source_dir.path().join("apps/api/main.go"), "package main").unwrap();
+        std::fs::write(source_dir.path().join("README.md"), "root").unwrap();
+
+        {
+            let mut index = repo.index().unwrap();
+            index
+                .add_path(std::path::Path::new("apps/web/index.html"))
+                .unwrap();
+            index
+                .add_path(std::path::Path::new("apps/api/main.go"))
+                .unwrap();
+            index.add_path(std::path::Path::new("README.md")).unwrap();
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+        }
+
+        let target_dir = TempDir::new().unwrap();
+        let source_url = format!("file://{}", source_dir.path().display());
+        let result = sparse_clone_repo(&source_url, target_dir.path(), "apps/web", None, None);
+        assert!(result.is_ok(), "sparse clone failed: {:?}", result.err());
+        assert!(target_dir.path().join("apps/web/index.html").exists());
+        assert!(!target_dir.path().join("apps/api/main.go").exists());
     }
 }
