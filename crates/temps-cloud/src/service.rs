@@ -48,6 +48,8 @@ pub enum CloudServiceError {
     ManagedBackupCredential(#[from] temps_entities::s3_sources::S3SourceCredentialError),
     #[error("Could not set up the backup schedule for the managed destination: {0}")]
     ManagedBackupSchedule(#[from] temps_core::ManagedBackupScheduleError),
+    #[error("Could not provision the managed console-access OIDC provider: {0}")]
+    ConsoleOidcProvisioning(#[from] temps_auth::oidc_errors::OidcError),
 }
 
 /// Outcome of attempting to provision a Cloud-managed backup source as part
@@ -230,6 +232,15 @@ pub struct CloudService {
     /// Cloud answered without a figure (older backend), so the default
     /// applies.
     managed_backup_retention_days: RwLock<Option<Option<u16>>>,
+    /// ADR-045 §4: provisions/revokes the managed `oidc_providers` row for
+    /// console access. `OnceLock` rather than a constructor argument because
+    /// `temps-auth`'s `OidcService` is registered by a different plugin;
+    /// two-phase plugin init hands it over once both exist (see
+    /// `CloudPlugin::initialize_plugin_services`), the same pattern
+    /// `schedule_provisioner` above already uses for `temps-backup`. `None`
+    /// on a build with no auth plugin registered (never happens in practice,
+    /// but this degrades to "no managed provider" rather than panicking).
+    oidc_provisioner: OnceLock<Arc<temps_auth::oidc_service::OidcService>>,
 }
 
 impl CloudService {
@@ -260,7 +271,46 @@ impl CloudService {
             enrollment_lock: AsyncMutex::new(()),
             schedule_provisioner: OnceLock::new(),
             managed_backup_retention_days: RwLock::new(None),
+            oidc_provisioner: OnceLock::new(),
         }
+    }
+
+    /// Wire the managed-OIDC provisioner in once `temps-auth` has registered
+    /// it. Idempotent, mirroring [`Self::set_schedule_provisioner`].
+    pub fn set_oidc_service(&self, oidc_service: Arc<temps_auth::oidc_service::OidcService>) {
+        let _ = self.oidc_provisioner.set(oidc_service);
+    }
+
+    /// Upsert the managed console-access `oidc_providers` row from a
+    /// `ConsoleOidcConfig` frame (ADR-045 §4), delivered at enrollment or
+    /// provisioning time by a later change. A `None` [`Self::oidc_provisioner`]
+    /// (no auth plugin registered) degrades to a logged no-op rather than an
+    /// error — there is no console to authenticate into on such a build.
+    pub async fn apply_console_oidc_config(
+        &self,
+        config: temps_auth::oidc_service::ManagedCloudOidcConfig,
+    ) -> Result<(), CloudServiceError> {
+        let Some(oidc) = self.oidc_provisioner.get() else {
+            tracing::error!(
+                "received a managed console-access OIDC configuration but no OidcService is \
+                 registered on this build; console access cannot be authenticated"
+            );
+            return Ok(());
+        };
+        oidc.upsert_managed_cloud_provider(config).await?;
+        Ok(())
+    }
+
+    /// Delete the managed console-access `oidc_providers` row and invalidate
+    /// every session it issued (ADR-045 §4). Idempotent: a build with no
+    /// managed row, or no `OidcService` registered, returns `Ok(false)`
+    /// rather than erroring, since "there was nothing to revoke" is a normal
+    /// outcome.
+    pub async fn revoke_console_oidc_provider(&self) -> Result<bool, CloudServiceError> {
+        let Some(oidc) = self.oidc_provisioner.get() else {
+            return Ok(false);
+        };
+        Ok(oidc.revoke_managed_cloud_provider().await?)
     }
 
     /// Wire the backup scheduler in once it is registered. Idempotent.
@@ -1113,7 +1163,10 @@ impl CloudService {
     /// Disconnect this instance and remove any Cloud-managed backup source.
     /// Returns whether a managed source was found and removed, so the caller
     /// can decide whether to audit a credential revocation.
-    pub async fn disconnect(&self) -> Result<(CloudStatus, bool), CloudServiceError> {
+    /// Disconnects this instance, releasing everything the link provisioned.
+    /// Returns `(status, backup_credential_revoked, console_oidc_revoked)` so
+    /// the caller can audit each independently.
+    pub async fn disconnect(&self) -> Result<(CloudStatus, bool, bool), CloudServiceError> {
         if !self.link.is_linked() {
             // Nothing to revoke, so nothing to release either: the answer
             // `revoke` would give, before any schedule is touched.
@@ -1124,6 +1177,19 @@ impl CloudService {
         // cleanup below refuses to remove a destination a schedule still
         // points at. A failure here leaves the link intact and is reported.
         self.release_managed_backup_schedules().await?;
+        // ADR-045 §4: revoke the managed console-access OIDC provider (and
+        // its sessions) before the credential itself, the same ordering
+        // `remove_managed_backup_source` already follows below.
+        //
+        // SECURITY: a failure here is fatal to the disconnect, like the
+        // schedule release above. Swallowing it would report a successful
+        // disconnect while the enabled provider and every session it issued
+        // stayed live — Cloud identities keeping console access on an
+        // instance the operator believes they just cut loose, with no audit
+        // row recording a revocation and nothing to retry. Leaving the link
+        // intact instead means the operator sees the error and can retry the
+        // disconnect once the database is reachable again.
+        let console_oidc_revoked = self.revoke_console_oidc_provider().await?;
         match self.link.revoke().await {
             Ok(()) | Err(CloudError::CredentialRejected) => {}
             Err(error) => return Err(CloudServiceError::Client(error)),
@@ -1132,7 +1198,7 @@ impl CloudService {
         let removed = self.remove_managed_backup_source().await?;
         self.set_managed_backup_setup(default_managed_backup_setup(false));
         let status = self.status().await?;
-        Ok((status, removed))
+        Ok((status, removed, console_oidc_revoked))
     }
 
     async fn has_managed_backup_source(&self) -> Result<bool, CloudServiceError> {
@@ -1743,6 +1809,95 @@ mod tests {
                 panic!("expected a bucket-changed outcome")
             }
         }
+    }
+
+    /// A [`CloudService`] whose link is already enrolled, so `disconnect`
+    /// runs its full release sequence instead of returning `NotEnrolled`.
+    /// Returns the `TempDir` too: dropping it removes the state file the link
+    /// reads and writes.
+    fn linked_cloud_service(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> (tempfile::TempDir, CloudService) {
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let state_dir = temp.path().join("cloud-link");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::json!({
+                "instance_id": uuid::Uuid::new_v4(),
+                "base_url": "http://127.0.0.1:9/",
+                "allow_loopback_development": true,
+                "token": "test-link-token",
+                "tenant_id": serde_json::Value::Null,
+                "account_email": serde_json::Value::Null,
+            })
+            .to_string(),
+        )
+        .expect("state file");
+
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            temp.path().to_path_buf(),
+            "test-agent",
+        ));
+        let config = Arc::new(ConfigService::new(
+            Arc::new(
+                temps_config::ServerConfig::new(
+                    "127.0.0.1:3000".to_string(),
+                    "postgresql://test".to_string(),
+                    None,
+                    Some("127.0.0.1:8000".to_string()),
+                )
+                .expect("ServerConfig::new"),
+            ),
+            db.clone(),
+        ));
+        let encryption = Arc::new(EncryptionService::new_from_password("cloud-service-test"));
+        (temp, CloudService::new(link, config, db, encryption, true))
+    }
+
+    /// SECURITY: disconnecting must not report success while the managed
+    /// console-access provider — and every session it issued — is still
+    /// live. If revocation fails, the link stays intact so the operator sees
+    /// the failure and can retry, rather than being told the instance is
+    /// disconnected while Cloud identities keep console access.
+    #[tokio::test]
+    async fn disconnect_fails_when_the_managed_console_provider_cannot_be_revoked() {
+        // The service's own DB: one lookup for the managed backup source,
+        // which finds nothing, so schedule release is a no-op.
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<temps_entities::s3_sources::Model>::new()])
+                .into_connection(),
+        );
+        let (_temp, service) = linked_cloud_service(db);
+
+        // The auth DB fails the moment revocation touches it.
+        let oidc_db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors(vec![sea_orm::DbErr::Custom(
+                    "connection reset while revoking the managed provider".to_string(),
+                )])
+                .into_connection(),
+        );
+        let oidc = Arc::new(temps_auth::oidc_service::OidcService::new(
+            oidc_db.clone(),
+            Arc::new(EncryptionService::new_from_password("oidc-revocation-test")),
+            Arc::new(temps_auth::UserService::new(oidc_db)),
+        ));
+        service.set_oidc_service(oidc);
+
+        let error = service
+            .disconnect()
+            .await
+            .expect_err("a failed console-provider revocation must fail the disconnect");
+        assert!(
+            matches!(error, CloudServiceError::ConsoleOidcProvisioning(_)),
+            "expected the revocation failure to surface, got {error}"
+        );
+        assert!(
+            service.link.is_linked(),
+            "the link must stay intact so the operator can retry the disconnect"
+        );
     }
 }
 
