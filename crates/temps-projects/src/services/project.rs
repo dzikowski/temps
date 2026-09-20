@@ -762,6 +762,46 @@ fn applied_service_template_from_model(
 }
 
 impl ProjectService {
+    pub async fn compose_security_policy(
+        &self,
+        project_id: i32,
+    ) -> Result<
+        temps_entities::compose_security::ComposeSecurityPolicy,
+        super::compose_security::ComposeSecurityError,
+    > {
+        super::compose_security::read(self.db.as_ref(), project_id).await
+    }
+    pub async fn compose_security_legacy_migration_pending(
+        &self,
+        project_id: i32,
+    ) -> Result<bool, super::compose_security::ComposeSecurityError> {
+        super::compose_security::legacy_migration_pending(self.db.as_ref(), project_id).await
+    }
+
+    pub async fn update_compose_security_policy(
+        &self,
+        project_id: i32,
+        actor: i32,
+        policy: temps_entities::compose_security::ComposeSecurityPolicy,
+        acknowledged: bool,
+        expected_policy: temps_entities::compose_security::ComposeSecurityPolicy,
+        acknowledge_legacy_migration: bool,
+    ) -> Result<
+        temps_entities::compose_security::ComposeSecurityPolicy,
+        super::compose_security::ComposeSecurityError,
+    > {
+        super::compose_security::update(
+            self.db.as_ref(),
+            project_id,
+            actor,
+            policy,
+            acknowledged,
+            expected_policy,
+            acknowledge_legacy_migration,
+        )
+        .await
+    }
+
     pub fn new(
         db: Arc<temps_database::DbConnection>,
         queue_service: Arc<dyn temps_core::JobQueue>,

@@ -126,17 +126,14 @@ impl BackupJobProcessor {
                         engine,
                         reason,
                     }) => {
-                        // A capability this process does not have. The
-                        // executor already failed the row with that reason
-                        // (and its remedy) and closed the schedule run, so
-                        // the schedule keeps ticking and the operator sees
-                        // a real error rather than a row that never moves.
+                        // There is no remote backup dispatcher. The executor
+                        // records a terminal failure with the missing capability.
                         warn!(
                             backup_id,
                             engine = %engine,
                             reason = %reason,
-                            "BackupJobProcessor: BackupRequested for an engine this process \
-                             cannot run; executor already flipped row to failed with the reason",
+                            "BackupJobProcessor: failed BackupRequested because the engine is \
+                             unavailable on this process",
                         );
                     }
                     Err(SpawnError::Database(e)) => {

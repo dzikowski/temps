@@ -278,6 +278,8 @@ pub mod m20260917_000002_add_breach_started_at_to_alert_rules;
 pub mod m20260917_000003_add_cron_next_run_at_to_project_agents;
 pub mod m20260919_000001_add_failover_at_to_nodes;
 
+mod m20260920_000001_compose_security_policies;
+
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -611,6 +613,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260918_000001_visitor_activity_run_history::Migration),
             Box::new(m20260919_000001_add_failover_at_to_nodes::Migration),
             Box::new(m20260919_000001_add_managed_by_cloud_to_oidc_providers::Migration),
+            Box::new(m20260920_000001_compose_security_policies::Migration),
         ]
     }
 }
