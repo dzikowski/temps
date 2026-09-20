@@ -51466,6 +51466,10 @@ export type ListContainersErrors = {
      */
     404: unknown;
     /**
+     * A container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -51505,6 +51509,10 @@ export type GetContainerDetailErrors = {
      * Container not found
      */
     404: unknown;
+    /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -51553,6 +51561,10 @@ export type GetContainerEnvironmentVariableErrors = {
      * Container or environment variable not found
      */
     404: unknown;
+    /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -51649,6 +51661,10 @@ export type GetContainerMetricsErrors = {
      * Container not found
      */
     404: unknown;
+    /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -51791,6 +51807,10 @@ export type RestartContainerErrors = {
      */
     404: unknown;
     /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -51831,6 +51851,10 @@ export type StartContainerErrors = {
      */
     404: unknown;
     /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -51870,6 +51894,10 @@ export type StopContainerErrors = {
      * Container not found
      */
     404: unknown;
+    /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -51912,6 +51940,10 @@ export type DeployFromImageErrors = {
      * Project or environment not found
      */
     404: unknown;
+    /**
+     * Claiming a local daemon image needs a local Docker daemon, which this process has none of
+     */
+    409: unknown;
     /**
      * Internal server error
      */
