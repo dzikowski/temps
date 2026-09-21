@@ -755,7 +755,8 @@ mod tests {
 
         let target_dir = TempDir::new().unwrap();
         let source_url = format!("file://{}", source_dir.path().display());
-        let result = sparse_clone_repo(&source_url, target_dir.path(), "apps/web", None, None).await;
+        let result =
+            sparse_clone_repo(&source_url, target_dir.path(), "apps/web", None, None).await;
         assert!(result.is_ok(), "sparse clone failed: {:?}", result.err());
         assert!(target_dir.path().join("apps/web/index.html").exists());
         assert!(!target_dir.path().join("apps/api/main.go").exists());
