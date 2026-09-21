@@ -329,11 +329,24 @@ pub fn validate_sparse_subdirectory(subdirectory: &str) -> Result<String, GitOps
     Ok(normalized)
 }
 
+/// Escape a literal path so non-cone sparse-checkout treats it as one
+/// directory, not a gitignore glob (`*`, `?`, `[`, `]`, `\`).
+fn escape_sparse_gitignore_literal(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for ch in path.chars() {
+        if matches!(ch, '\\' | '*' | '?' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 /// Non-cone pattern that includes only `subdirectory` and nothing at the
 /// repository root. Cone mode always materializes root files; this flag is
 /// for the opposite case.
 fn sparse_checkout_pattern(subdirectory: &str) -> String {
-    format!("/{subdirectory}/")
+    format!("/{}/", escape_sparse_gitignore_literal(subdirectory))
 }
 
 /// Clone only `subdirectory` using git sparse-checkout (partial clone).
@@ -731,6 +744,19 @@ mod tests {
             validate_sparse_subdirectory("apps/web/").unwrap(),
             "apps/web"
         );
+        assert_eq!(
+            validate_sparse_subdirectory("apps/we[b]").unwrap(),
+            "apps/we[b]"
+        );
+    }
+
+    #[test]
+    fn test_sparse_checkout_pattern_escapes_gitignore_metacharacters() {
+        assert_eq!(sparse_checkout_pattern("apps/web"), "/apps/web/");
+        assert_eq!(sparse_checkout_pattern("apps/we[b]"), r"/apps/we\[b\]/");
+        assert_eq!(sparse_checkout_pattern("apps/web?"), r"/apps/web\?/");
+        assert_eq!(sparse_checkout_pattern("apps/*"), r"/apps/\*/");
+        assert_eq!(sparse_checkout_pattern(r"apps/web]"), r"/apps/web\]/");
     }
 
     #[tokio::test]
@@ -805,5 +831,50 @@ mod tests {
             result.err()
         );
         assert!(target_dir.path().join("-site/app/index.html").exists());
+    }
+
+    #[tokio::test]
+    async fn test_sparse_clone_treats_bracket_directory_as_literal() {
+        let source_dir = TempDir::new().unwrap();
+        let repo = Repository::init(source_dir.path()).unwrap();
+        let sig = Signature::now("Test", "test@test.com").unwrap();
+
+        std::fs::create_dir_all(source_dir.path().join("apps/we[b]")).unwrap();
+        std::fs::create_dir_all(source_dir.path().join("apps/web")).unwrap();
+        std::fs::write(source_dir.path().join("apps/we[b]/index.html"), "bracket").unwrap();
+        std::fs::write(source_dir.path().join("apps/web/index.html"), "plain").unwrap();
+
+        {
+            let mut index = repo.index().unwrap();
+            index
+                .add_path(std::path::Path::new("apps/we[b]/index.html"))
+                .unwrap();
+            index
+                .add_path(std::path::Path::new("apps/web/index.html"))
+                .unwrap();
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+        }
+
+        let target_dir = TempDir::new().unwrap();
+        let source_url = format!("file://{}", source_dir.path().display());
+        let result =
+            sparse_clone_repo(&source_url, target_dir.path(), "apps/we[b]", None, None).await;
+        assert!(
+            result.is_ok(),
+            "literal bracket sparse clone failed: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(target_dir.path().join("apps/we[b]/index.html")).unwrap(),
+            "bracket"
+        );
+        assert!(
+            !target_dir.path().join("apps/web/index.html").exists(),
+            "unescaped [b] would match apps/web"
+        );
     }
 }
