@@ -98152,6 +98152,9 @@
           "404": {
             "description": "Job not found"
           },
+          "422": {
+            "description": "Report text is empty"
+          },
           "500": {
             "description": "Internal server error"
           },

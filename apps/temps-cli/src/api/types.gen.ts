@@ -50611,6 +50611,10 @@ export type SendFailureReportErrors = {
      */
     404: unknown;
     /**
+     * Report text is empty
+     */
+    422: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
