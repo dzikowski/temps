@@ -368,22 +368,15 @@ pub struct ServiceTag {
     pub value: String,
 }
 
-/// Storage configuration
-#[derive(Debug, Clone)]
-pub enum StorageConfig {
-    Filesystem {
-        base_path: std::path::PathBuf,
-    },
-    S3 {
-        bucket: String,
-        prefix: Option<String>,
-        region: String,
-        endpoint: Option<String>,
-        access_key_id: String,
-        secret_access_key: String,
-        force_path_style: bool,
-    },
-}
+/// Storage configuration.
+///
+/// Re-exported from `temps_core::LogStorageConfig`, the shared type that also
+/// drives `temps-logs`' build/deploy-log archival -- one
+/// `TEMPS_LOG_STORAGE_BACKEND` / `TEMPS_LOG_S3_*` env-var set configures
+/// where Temps puts both aggregated container logs (this crate) and
+/// build/deploy job logs. See `temps_core::log_storage_config` for the
+/// rationale on why the type lives there instead of here.
+pub use temps_core::LogStorageConfig as StorageConfig;
 
 /// Retention configuration per project
 #[derive(Debug, Clone)]

@@ -2,127 +2,96 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { ReactNode } from 'react'
-import { RefreshCw, Settings as SettingsIcon } from 'lucide-react'
-import { Button } from './ui/button'
-import { Skeleton } from './ui/skeleton'
+import type { LucideIcon } from 'lucide-react'
+import { Button } from '@temps-sdk/ui'
 import { cn } from './lib/cn'
 
 /**
- * One component for every non-happy state of a surface. The console today
- * has three empty-state implementations, 134 files with spinners and 141
- * with skeletons; this replaces all of them.
+ * Consolidates `EmptyPlaceholder` and `EmptyState`
+ * (web/src/components/ui/empty-placeholder.tsx, empty-state.tsx — 101 lines
+ * combined, near-duplicates) into one primitive covering every reason a page
+ * has nothing to show:
  *
- *  loading       skeleton rows. Never a spinner as page state.
- *  empty         nothing to show and that is fine. Says why, offers a next step.
- *  unconfigured  depends on operator setup that is missing. Says exactly what
- *                is missing, shows an EXAMPLE of what the surface would show,
- *                links to the settings page. Never renders nothing.
- *  error         the surface failed. Message, the resource involved, retry.
- *
- * Self-hosted users have no support channel. A failure that needs a restart
- * to notice is a design failure.
+ * - `empty`: the resource exists and is configured, there's just nothing in
+ *   it yet ("No deployments yet").
+ * - `not-set-up`: CLAUDE.md's rule, made a first-class variant instead of a
+ *   nice-to-have. A feature that depends on optional operator config (AI
+ *   provider, S3 bucket, SMTP, DNS token) must never render nothing —
+ *   `requirement` and `example` are REQUIRED for this variant so the
+ *   surface always says what's missing and what it would do, and `action`
+ *   should link straight to the settings page that configures it.
+ * - `failed`: a request errored. Pairs with a retry action.
  */
-export type PageStateProps =
-  | { state: 'loading'; rows?: number }
-  | { state: 'empty'; title: string; reason: string; next?: ReactNode }
-  | {
-      state: 'unconfigured'
-      title: string
-      missing: string
-      example: ReactNode
-      /** A real console path (`/settings/…`). `#` is not allowed: the link to the fix is the point of this state. */ settingsHref: `/${string}`
-      settingsLabel: string
-    }
-  | {
-      state: 'error'
-      title: string
-      message: string
-      resource: string
-      onRetry: () => void
-      retrying?: boolean
-    }
+export type PageStateVariant = 'empty' | 'not-set-up' | 'failed'
 
-export function PageState(p: PageStateProps & { className?: string }) {
-  if (p.state === 'loading') {
-    return (
-      <div
-        className={cn('op-rows border', p.className)}
-        role="status"
-        aria-busy="true"
-        aria-label="Loading"
-      >
-        {Array.from({ length: p.rows ?? 5 }, (_, i) => (
-          <div key={i} className="op-row flex items-center gap-3">
-            {/* Percent widths: fixed px widths give the row a min-content wider than a narrow grid cell and blow the layout. */}
-            <Skeleton className="h-3 w-[28%] rounded-none" />
-            <Skeleton className="h-3 w-[40%] rounded-none" />
-            <Skeleton className="ml-auto h-3 w-[12%] rounded-none" />
-          </div>
-        ))}
-      </div>
-    )
-  }
-  if (p.state === 'empty') {
-    return (
-      <div className={cn('border p-6', p.className)}>
-        <p className="op-h3">{p.title}</p>
-        <p className="op-prose mt-1 max-w-md text-xs text-muted-foreground">
-          {p.reason}
-        </p>
-        {p.next && <div className="mt-4">{p.next}</div>}
-      </div>
-    )
-  }
-  if (p.state === 'unconfigured') {
-    // Both columns are min-w-0: a grid item's automatic minimum is its min-content width, so an unbreakable token in `example` (a curl body, a long URL) would otherwise widen the page on a phone.
-    return (
-      <div
-        className={cn(
-          'grid min-w-0 border md:grid-cols-2 [&>*]:min-w-0',
-          p.className
-        )}
-      >
-        <div className="p-6">
-          <p className="op-label">not set up</p>
-          <p className="op-h3 mt-2">{p.title}</p>
-          <p className="op-prose mt-1 max-w-md text-xs text-muted-foreground">
-            Missing: {p.missing}
-          </p>
-          <Button size="sm" className="op-primary mt-4 h-8 text-xs" asChild>
-            <a href={p.settingsHref}>
-              <SettingsIcon /> {p.settingsLabel}
-            </a>
-          </Button>
-        </div>
-        <div className="op-inset border-t p-4 md:border-l md:border-t-0">
-          <p className="op-label">what this shows once configured</p>
-          <div className="mt-3 opacity-80">{p.example}</div>
-        </div>
-      </div>
-    )
-  }
+interface PageStateBaseProps {
+  icon: LucideIcon
+  title: string
+  description?: ReactNode
+  action?: ReactNode
+  size?: 'default' | 'compact'
+  className?: string
+}
+
+interface EmptyPageStateProps extends PageStateBaseProps {
+  variant: 'empty' | 'failed'
+}
+
+interface NotSetUpPageStateProps extends PageStateBaseProps {
+  variant: 'not-set-up'
+  /** What's missing, in plain words — "No AI provider configured." */
+  requirement: string
+  /** A concrete example of what the feature would do once configured. */
+  example: ReactNode
+  /** Link straight to the settings page that configures it. */
+  settingsHref: string
+  settingsLabel?: string
+}
+
+export type PageStateProps = EmptyPageStateProps | NotSetUpPageStateProps
+
+export function PageState(props: PageStateProps) {
+  const { icon: Icon, title, size = 'default', className } = props
+  const compact = size === 'compact'
+
   return (
     <div
-      className={cn('border border-destructive p-6', p.className)}
-      role="alert"
+      data-page-state={props.variant}
+      className={cn(
+        'flex flex-col items-center justify-center rounded-lg text-center animate-in fade-in-50',
+        compact ? 'min-h-60 gap-3 p-6' : 'min-h-[25rem] gap-4 p-8',
+        className,
+      )}
     >
-      <p className="op-h3 text-destructive">{p.title}</p>
-      <p className="mt-1 font-mono text-xs">{p.message}</p>
-      <p className="mt-1 text-xs text-muted-foreground">
-        resource: <span className="font-mono">{p.resource}</span>
-      </p>
-      <Button
-        size="sm"
-        variant="outline"
-        className="mt-4 h-8 text-xs"
-        onClick={p.onRetry}
-        disabled={p.retrying}
+      <div
+        className={cn(
+          'flex items-center justify-center rounded-full bg-muted',
+          compact ? 'size-14' : 'size-20',
+        )}
       >
-        {/* Retrying is work in flight, so it takes the `running` pulse, not a spin: a
-            spinner is now only sanctioned inline on a submitting button. docs/motion.md. */}
-        <RefreshCw className={cn(p.retrying && 'op-pulse')} />{' '}
-        {p.retrying ? 'retrying…' : 'retry'}
-      </Button>
+        <Icon className={cn('text-muted-foreground', compact ? 'size-7' : 'size-10')} />
+      </div>
+      <div className="max-w-md space-y-2">
+        <h3 className={cn('font-semibold', compact ? 'text-base' : 'text-lg')}>{title}</h3>
+        {props.variant === 'not-set-up' ? (
+          <div className="space-y-2 text-left sm:text-center">
+            <p className="text-sm text-muted-foreground">{props.requirement}</p>
+            <p className="rounded-md border border-dashed bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
+              <span className="font-medium text-foreground">Example: </span>
+              {props.example}
+            </p>
+          </div>
+        ) : props.description ? (
+          <p className="text-sm text-muted-foreground">{props.description}</p>
+        ) : null}
+      </div>
+      {props.variant === 'not-set-up' ? (
+        <Button asChild>
+          <a href={props.settingsHref}>{props.settingsLabel ?? 'Open settings'}</a>
+        </Button>
+      ) : (
+        props.action
+      )}
     </div>
   )
 }

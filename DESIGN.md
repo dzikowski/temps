@@ -1,10 +1,20 @@
 # Temps console design standard
 
-This is the authoritative UI reference for contributors working in `web/src`.
-Use the existing shadcn/ui components, Tailwind semantic tokens, and shared
-layouts. The separate prototype app has been retired; it is not an alternative
-design direction. The retained `web/packages/ds` package is not the default
-for console work and must not be introduced as an incidental redesign.
+This is the authoritative UI reference for existing contributions to
+`web/src`. Use the existing shadcn/ui components, Tailwind semantic tokens,
+and shared layouts. The separate "operator ink" prototype app has been
+retired; it is not an alternative design direction and never was one worth
+resurrecting.
+
+`web/packages/ds` (`@temps-sdk/ds`) is a real, maintained package — the
+codification of these same conventions into reusable page/record/list/
+settings templates, built on `@temps-sdk/ui`. See its
+`docs/design-system-handoff.md` and `docs/RULES.md`. It is not yet a mandate
+to migrate `web/src` screen by screen — that migration is tracked as numbered
+follow-ups in the handoff doc, not assumed to have happened. New work that
+fits one of its templates should use it; retrofitting an existing screen is a
+deliberate, separate decision, not an incidental side effect of an unrelated
+change.
 
 The product should feel like one application: consistent page width, compact
 resource lists, predictable controls, and useful states when data is absent.
@@ -260,3 +270,13 @@ screens have been migrated.
 
 Exceptions require an explicit product decision. Update this document alongside
 the shared implementation rather than creating a competing design guide.
+
+## 9. Embedded plugin workspaces
+
+Plugins inherit the resolved Temps light/dark theme and follow live changes. They do not expose an independent theme toggle or persist a separate theme preference. Standalone previews may follow the OS preference.
+
+The host owns plugin identity. Inside the plugin, use a compact view title rather than repeating the plugin name and description. Multi-view plugins use an internal sidebar with Lucide icons and text labels; on narrow screens it becomes a horizontally scrollable navigation strip.
+
+Separate history lists from record details using addressable routes. Paginate history and result collections with shared responsive pagination, clamp pages after filtering or deletion, and preserve keyboard navigation. Starting a job opens its detail view; returning to history must not cancel it.
+
+Plugin workspaces fill the available iframe height. Navigation and the view toolbar remain visible while the content region scrolls. Do not stack the creation form, entire history, and expanded report on one page. Bound expanded diagnostics so long referrer lists do not push every other control out of reach.

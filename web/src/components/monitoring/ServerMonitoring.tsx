@@ -4,7 +4,7 @@
 /**
  * ServerMonitoring — resource usage of the machine running the control plane.
  *
- * Route: /monitoring/server (the "Server" section of Monitoring & Alerts).
+ * Route: /monitoring/server (standalone Server page).
  *
  * Six panels, in the shape of the Proxy page: CPU, memory and disk usage
  * (current value + progress bar + history), Docker disk usage (docker system
@@ -14,6 +14,9 @@
  * generated SDK bindings.
  */
 
+import { HelpPopover } from '@temps-sdk/ds'
+
+import { PageHeader } from '@temps-sdk/ds'
 import {
   nodeDockerDiskUsageGetOptions,
   nodeMetricsGetLatestOptions,
@@ -143,12 +146,16 @@ function UsageCard({
 }: UsageCardProps) {
   const tone = usageTone(percent, thresholds)
   return (
-    <Card>
+    <Card className="shadow-none">
       <CardHeader className="pb-2">
-        <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          {title}
-        </CardTitle>
-        <CardDescription>{description}</CardDescription>
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            {title}
+          </CardTitle>
+          <HelpPopover label={`About ${title.toLowerCase()}`}>
+            {description}
+          </HelpPopover>
+        </div>
       </CardHeader>
       <CardContent>
         {isPending ? (
@@ -158,7 +165,7 @@ function UsageCard({
           </div>
         ) : (
           <>
-            <div className="flex items-baseline justify-between gap-3">
+            <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
               <span
                 className={cn(
                   'text-2xl font-semibold tracking-tight tabular-nums',
@@ -220,10 +227,14 @@ function ChartPanel({
   footer,
 }: ChartPanelProps) {
   return (
-    <Card>
+    <Card className="shadow-none">
       <CardHeader className="pb-2">
-        <CardTitle className="text-base">{title}</CardTitle>
-        <CardDescription>{description}</CardDescription>
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="text-base">{title}</CardTitle>
+          <HelpPopover label={`About ${title.toLowerCase()} chart`}>
+            {description}
+          </HelpPopover>
+        </div>
       </CardHeader>
       <CardContent>
         {isPending ? (
@@ -295,7 +306,7 @@ function DockerDiskUsageCard() {
       )
     : 0
   return (
-    <Card>
+    <Card className="shadow-none">
       <CardHeader className="flex flex-row items-start justify-between gap-2 space-y-0 pb-2">
         <div>
           <CardTitle className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
@@ -343,7 +354,7 @@ function DockerDiskUsageCard() {
           </div>
         ) : (
           <>
-            <div className="flex items-baseline justify-between gap-3">
+            <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
               <span className="text-2xl font-semibold tracking-tight tabular-nums">
                 {formatBytesDecimal(usage.total_bytes)}
               </span>
@@ -569,7 +580,7 @@ export function ServerMonitoring() {
           paused={paused}
           onTogglePause={() => setPaused((p) => !p)}
         />
-        <Card>
+        <Card className="shadow-none">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <AlertTriangle className="h-4 w-4 text-amber-500" />
@@ -785,45 +796,54 @@ function SectionIntro({
   onTogglePause: () => void
 }) {
   return (
-    <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-      <div className="min-w-0">
-        <h3 className="text-lg font-semibold tracking-tight">Server</h3>
-        <p className="text-sm text-muted-foreground">
-          Resource usage of the machine running this control plane, sampled
-          every {formatAge(scrapeInterval)}
-          {ageSeconds != null
-            ? ` · last sample ${formatAge(ageSeconds)} ago`
-            : ''}
-          {paused ? ' · updates paused' : ' · refreshes every 30 s'}. Hover or
-          focus a chart and use ← → to read every panel at one instant.
-        </p>
-      </div>
-      <div className="flex shrink-0 flex-wrap items-center gap-1">
-        <Button
-          variant="outline"
-          size="sm"
-          aria-pressed={paused}
-          onClick={onTogglePause}
-          className="mr-2"
-        >
-          {paused ? (
-            <Play className="mr-1.5 h-3.5 w-3.5" />
-          ) : (
-            <Pause className="mr-1.5 h-3.5 w-3.5" />
-          )}
-          {paused ? 'Resume' : 'Pause'}
-        </Button>
-        {PROXY_RANGE_PRESETS.map((opt) => (
+    <PageHeader
+      title="Server"
+      actions={
+        <div className="flex shrink-0 flex-wrap items-center gap-1">
+          <div className="mr-3 flex items-center gap-1 whitespace-nowrap text-xs text-muted-foreground">
+            {paused
+              ? 'Updates paused'
+              : ageSeconds != null
+                ? `Updated ${formatAge(ageSeconds)} ago`
+                : 'Waiting for a sample'}
+            <HelpPopover label="About server metrics">
+              <p>
+                Resource usage of the control-plane host. Samples are collected
+                every {formatAge(scrapeInterval)} and refreshed every 30
+                seconds.
+              </p>
+              <p>
+                Hover or focus a chart and use the arrow keys to compare every
+                panel at the same instant.
+              </p>
+            </HelpPopover>
+          </div>
           <Button
-            key={opt.value}
-            variant={range === opt.value ? 'default' : 'outline'}
+            variant="outline"
             size="sm"
-            onClick={() => onRange(opt.value)}
+            aria-pressed={paused}
+            onClick={onTogglePause}
+            className="mr-2"
           >
-            {opt.label}
+            {paused ? (
+              <Play className="mr-1.5 h-3.5 w-3.5" />
+            ) : (
+              <Pause className="mr-1.5 h-3.5 w-3.5" />
+            )}
+            {paused ? 'Resume' : 'Pause'}
           </Button>
-        ))}
-      </div>
-    </div>
+          {PROXY_RANGE_PRESETS.map((opt) => (
+            <Button
+              key={opt.value}
+              variant={range === opt.value ? 'default' : 'outline'}
+              size="sm"
+              onClick={() => onRange(opt.value)}
+            >
+              {opt.label}
+            </Button>
+          ))}
+        </div>
+      }
+    />
   )
 }

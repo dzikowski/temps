@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+mod m20260916_000001_visitor_activity_reports;
+mod m20260918_000001_visitor_activity_run_history;
+mod m20260919_000001_add_managed_by_cloud_to_oidc_providers;
+
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -273,6 +277,9 @@ pub mod m20260917_000001_add_next_check_at_to_status_monitors;
 pub mod m20260917_000002_add_breach_started_at_to_alert_rules;
 pub mod m20260917_000003_add_cron_next_run_at_to_project_agents;
 mod m20260918_000001_add_pull_only_root_directory_to_projects;
+pub mod m20260919_000001_add_failover_at_to_nodes;
+
+mod m20260920_000001_compose_security_policies;
 
 pub struct Migrator;
 
@@ -603,6 +610,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20260917_000001_add_next_check_at_to_status_monitors::Migration),
             Box::new(m20260917_000002_add_breach_started_at_to_alert_rules::Migration),
             Box::new(m20260917_000003_add_cron_next_run_at_to_project_agents::Migration),
+            Box::new(m20260916_000001_visitor_activity_reports::Migration),
+            Box::new(m20260918_000001_visitor_activity_run_history::Migration),
+            Box::new(m20260919_000001_add_failover_at_to_nodes::Migration),
+            Box::new(m20260919_000001_add_managed_by_cloud_to_oidc_providers::Migration),
+            Box::new(m20260920_000001_compose_security_policies::Migration),
             Box::new(m20260918_000001_add_pull_only_root_directory_to_projects::Migration),
         ]
     }

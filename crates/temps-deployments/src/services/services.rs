@@ -146,6 +146,17 @@ pub enum DeploymentError {
         reason: String,
     },
 
+    /// A container operation was asked of a process that has no local Docker
+    /// daemon (e.g. a control plane started with `--profile control-plane`).
+    ///
+    /// Kept distinct from [`Self::ContainerOperation`] on purpose: that
+    /// variant stringifies its cause into a generic 500, which turned "this
+    /// host runs no containers, join a worker node" into an opaque server
+    /// error. This one is mapped to the shared 409 `WORKER_NODE_REQUIRED`
+    /// problem, so the response tells the operator what to do.
+    #[error(transparent)]
+    DockerUnavailable(#[from] temps_core::DockerUnavailable),
+
     #[error("Container exec for {container_id} timed out after {timeout_seconds} seconds")]
     ContainerExecTimeout {
         container_id: String,
@@ -341,7 +352,7 @@ pub struct DeploymentService {
     config_service: Arc<temps_config::ConfigService>,
     queue_service: Arc<dyn temps_core::JobQueue>,
     docker_log_service: Arc<temps_logs::DockerLogService>,
-    docker: Arc<bollard::Docker>,
+    docker_handle: Arc<temps_core::DockerHandle>,
     deployer: Arc<dyn temps_deployer::ContainerDeployer>,
     encryption_service: Arc<temps_core::EncryptionService>,
     /// Anonymous product telemetry reporter (late-bound, optional). Set via
@@ -998,7 +1009,7 @@ impl DeploymentService {
         config_service: Arc<temps_config::ConfigService>,
         queue_service: Arc<dyn temps_core::JobQueue>,
         docker_log_service: Arc<temps_logs::DockerLogService>,
-        docker: Arc<bollard::Docker>,
+        docker_handle: Arc<temps_core::DockerHandle>,
         deployer: Arc<dyn temps_deployer::ContainerDeployer>,
         encryption_service: Arc<temps_core::EncryptionService>,
     ) -> Self {
@@ -1008,7 +1019,7 @@ impl DeploymentService {
             config_service,
             queue_service,
             docker_log_service,
-            docker,
+            docker_handle,
             deployer,
             encryption_service,
             telemetry: std::sync::OnceLock::new(),
@@ -1190,8 +1201,9 @@ impl DeploymentService {
         node_id: Option<i32>,
     ) -> Result<Arc<dyn ContainerOperations>, DeploymentError> {
         let Some(node_id) = node_id else {
+            let docker = self.docker_handle.require()?;
             return Ok(Arc::new(LocalContainerOperations::new(
-                self.docker.clone(),
+                docker,
                 self.docker_log_service.clone(),
                 self.deployer.clone(),
             )));
@@ -5781,9 +5793,8 @@ mod tests {
         // Create real docker log service for testing
         // For tests, we'll create a basic Docker connection (may fail but that's OK for tests)
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().unwrap());
-        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(Arc::new(
-            temps_core::DockerHandle::available(docker.clone()),
-        )));
+        let docker_handle = Arc::new(temps_core::DockerHandle::available(docker.clone()));
+        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(docker_handle.clone()));
 
         // Create mock deployer with all required methods
         let mut deployer = MockContainerDeployer::new();
@@ -5835,7 +5846,7 @@ mod tests {
             config_service,
             queue_service,
             docker_log_service,
-            docker,
+            docker_handle,
             deployer,
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
@@ -5908,16 +5919,15 @@ mod tests {
         let docker = Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("create Docker client config"),
         );
+        let docker_handle = Arc::new(temps_core::DockerHandle::available(docker));
 
         DeploymentService {
             db,
             log_service: Arc::new(temps_logs::LogService::new(std::env::temp_dir())),
             config_service,
             queue_service,
-            docker_log_service: Arc::new(temps_logs::DockerLogService::new(Arc::new(
-                temps_core::DockerHandle::available(docker.clone()),
-            ))),
-            docker,
+            docker_log_service: Arc::new(temps_logs::DockerLogService::new(docker_handle.clone())),
+            docker_handle,
             deployer,
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
@@ -6840,9 +6850,8 @@ mod tests {
         let queue_service: Arc<dyn temps_core::JobQueue> = Arc::new(queue_service);
 
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().unwrap());
-        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(Arc::new(
-            temps_core::DockerHandle::available(docker.clone()),
-        )));
+        let docker_handle = Arc::new(temps_core::DockerHandle::available(docker));
+        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(docker_handle.clone()));
 
         let mut deployer = MockContainerDeployer::new();
         deployer.expect_deploy_container().returning(|_| {
@@ -6865,7 +6874,7 @@ mod tests {
             config_service,
             queue_service,
             docker_log_service,
-            docker,
+            docker_handle,
             deployer,
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
@@ -8695,9 +8704,8 @@ mod tests {
         let queue_service: Arc<dyn temps_core::JobQueue> = Arc::new(queue_service);
 
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().unwrap());
-        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(Arc::new(
-            temps_core::DockerHandle::available(docker.clone()),
-        )));
+        let docker_handle = Arc::new(temps_core::DockerHandle::available(docker));
+        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(docker_handle.clone()));
 
         let db_for_check = db.clone();
         let mut deployer = MockContainerDeployer::new();
@@ -8734,7 +8742,7 @@ mod tests {
             config_service,
             queue_service,
             docker_log_service,
-            docker,
+            docker_handle,
             deployer,
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),

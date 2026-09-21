@@ -50,13 +50,20 @@ test('uninstall requires confirmation and automatically refreshes Running', asyn
     }
   )
   await page.goto('/settings/plugins')
-  await page.getByRole('button', { name: 'Uninstall', exact: true }).click()
+  await page.getByRole('tab', { name: /^Running/ }).click()
+  const openUninstall = async () => {
+    await page
+      .getByRole('button', { name: 'Actions for Deployment Pulse' })
+      .click()
+    await page.getByRole('menuitem', { name: 'Uninstall' }).click()
+  }
+  await openUninstall()
   const dialog = page.getByRole('alertdialog')
   await expect(dialog).toContainText('data is preserved')
   await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
   await expect(dialog).toBeHidden()
   expect(uninstallRequests).toBe(0)
-  await page.getByRole('button', { name: 'Uninstall', exact: true }).click()
+  await openUninstall()
   await dialog.getByRole('button', { name: 'Uninstall', exact: true }).click()
   await expect(dialog).toBeHidden()
   await expect(
@@ -112,11 +119,12 @@ for (const status of [207, 502]) {
       })
     })
     await page.goto('/settings/plugins')
+    await page.getByRole('tab', { name: /^Running/ }).click()
     await expect(
-      page.getByRole('button', { name: 'Uninstall', exact: true })
+      page.getByRole('button', { name: 'Actions for Deployment Pulse' })
     ).toBeVisible()
     await page
-      .getByRole('button', { name: 'Reload Plugins', exact: true })
+      .getByRole('button', { name: 'Reload plugins', exact: true })
       .click()
     const alert = page
       .getByRole('alert')
@@ -144,7 +152,7 @@ for (const status of [207, 502]) {
       contentType: 'image/png',
     })
     await page
-      .getByRole('button', { name: 'Reload Plugins', exact: true })
+      .getByRole('button', { name: 'Reload plugins', exact: true })
       .click()
     await expect(alert).toBeHidden()
     expect(consoleErrors).toEqual([])

@@ -24,8 +24,11 @@ pub struct AppState {
     pub workflow_planner: Arc<WorkflowPlanner>,
     pub workflow_executor: Arc<WorkflowExecutionService>,
     pub queue_service: Arc<dyn temps_core::JobQueue>,
-    // Blob service for static bundle uploads (optional, falls back to local storage)
-    pub blob_service: Arc<temps_blob::BlobService>,
+    // Blob service for static bundle uploads. `None` when this process has
+    // no local Docker daemon (`--profile control-plane`) or the operator
+    // hasn't enabled the Blob RustFS service — falls back to local storage
+    // (`data_dir`) in that case rather than failing plugin registration.
+    pub blob_service: Option<Arc<temps_blob::BlobService>>,
     /// Data directory for local file storage (static bundles, etc.)
     pub data_dir: std::path::PathBuf,
     /// Image builder for importing Docker images from tarballs
@@ -34,6 +37,10 @@ pub struct AppState {
     pub audit_service: Arc<dyn AuditLogger>,
     /// Node service for listing/getting worker nodes (UI-facing)
     pub node_service: Arc<NodeService>,
+    /// Placement policy for this process, used by the node capability
+    /// endpoint to answer "can anything run here?" with the same rules the
+    /// deploy path applies.
+    pub node_scheduler: Arc<crate::services::NodeScheduler>,
     /// Encryption service for decrypting node tokens (used by drain to stop remote containers)
     pub encryption_service: Arc<temps_core::EncryptionService>,
     /// Config service — gives drain/exit-facing handlers access to the cluster

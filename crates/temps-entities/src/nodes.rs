@@ -87,6 +87,13 @@ pub struct Model {
     /// heartbeat (from its last successful sync, or its on-disk snapshot if
     /// it hasn't synced yet). `None` means never reported.
     pub dns_resolver_record_count: Option<i32>,
+    /// When this node's workloads were failed over for the current outage.
+    /// `None` means they have not been: the node is healthy, or it is offline
+    /// but still inside the failover grace period (or a failover pass failed
+    /// and is being retried). Stamped by the health loop once failover is
+    /// durably queued and cleared by the next heartbeat, so failover completes
+    /// once per outage and survives a control-plane restart.
+    pub failover_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

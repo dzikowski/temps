@@ -149,7 +149,7 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
         await page.getByRole('option', { name: /Storefront/ }).click()
       }
       await expect(page).toHaveURL(/project_id=1/)
-      for (const preset of ['1h', '6h', '1d', '7d'])
+      for (const preset of ['1h', '6h', '24h', '7d'])
         await expect(
           page.getByRole('button', { name: preset, exact: true })
         ).toBeVisible()
@@ -182,7 +182,10 @@ for (const kind of Object.keys(fixtures) as Kind[]) {
       if (kind === 'traces')
         await expect(
           page.getByRole('link', { name: 'Cross-project waterfall' })
-        ).toHaveAttribute('href', `/traces/global/${traceId}`)
+        ).toHaveAttribute(
+          'href',
+          new RegExp(`^/traces/global/${traceId}\\?start_time=.+&end_time=.+`)
+        )
       if (kind === 'errors')
         await expect(
           page.getByRole('link', { name: 'Checkout failed' })
@@ -258,7 +261,11 @@ test('scan-budget exhaustion asks for a narrower search instead of claiming no l
       })
   )
   await page.goto('/logs')
-  await expect(page.getByText(/Scan limit reached/)).toBeVisible()
+  await expect(page.getByText(/No matching lines in this scan/)).toBeVisible()
+  await expect(page.getByText('0 loaded lines · partial results')).toBeVisible()
+  await page.getByRole('button', { name: 'About partial results' }).click()
+  await expect(page.getByText(/narrow your search or time range/)).toBeVisible()
+  await page.keyboard.press('Escape')
   await expect(page.getByText('No logs in this view')).toHaveCount(0)
   await expect(
     page.getByRole('button', { name: 'Next page', exact: true })
@@ -287,8 +294,18 @@ for (const width of [1440, 390]) {
     )
     await page.goto('/logs')
     await expect(
-      page.getByText(/Scan limit reached · showing partial results/)
+      page.getByText('1 loaded line · partial results', { exact: true })
     ).toBeVisible()
+    await page.getByRole('button', { name: 'About partial results' }).click()
+    const explanation = page.getByText(/This scan reached its limit/)
+    await expect(explanation).toBeVisible()
+    await expect(explanation).toContainText('Use Next page to continue')
+    await expect(explanation).toContainText('narrow your search or time range')
+    const box = await explanation.boundingBox()
+    expect(box!.x).toBeGreaterThanOrEqual(0)
+    expect(box!.x + box!.width).toBeLessThanOrEqual(width)
+    await page.keyboard.press('Escape')
+    await expect(explanation).toBeHidden()
     await expect(
       page.getByRole('cell', { name: 'Checkout request failed', exact: false })
     ).toBeVisible()
@@ -387,10 +404,10 @@ for (const width of [1440, 390]) {
       fullPage: true,
     })
     await page.keyboard.press('Escape')
-    await page.getByRole('button', { name: '1d', exact: true }).click()
+    await page.getByRole('button', { name: '24h', exact: true }).click()
     await expect(page).toHaveURL(/range=1d/)
     await expect(
-      page.getByRole('button', { name: '1d', exact: true })
+      page.getByRole('button', { name: '24h', exact: true })
     ).toHaveAttribute('aria-pressed', 'true')
   })
 }

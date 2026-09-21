@@ -2,72 +2,47 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { ReactNode } from 'react'
+import { AlertTriangle, CheckCircle2, Info, XCircle } from 'lucide-react'
 import { cn } from './lib/cn'
-import { GLYPH, GLYPH_CLASS, type State } from './status'
 
-/**
- * An alert that lives inside a page. A StatusLine is one sentence and rolls
- * up into the header; a Callout is for a fault that needs its evidence shown
- * where it applies: the glyph and the title in the state colour, a 2px rule
- * on the left in the same colour and no box (the rule is the alert; a frame
- * around it is a frame inside the page's frames), the raw message from the
- * other system in mono on the inset tone (quoted, never paraphrased), one
- * sentence of consequence and what the action changes, and the action. Error is red, warn amber, ok green,
- * idle ink. Never used for decoration: if nothing is wrong, nothing shows.
- */
-const RULE: Record<State, string> = {
-  error: 'border-l-destructive',
-  warn: 'border-l-warning',
-  ok: 'border-l-success',
-  idle: 'border-l-foreground',
-  sampled: 'border-l-muted-foreground',
-  running: 'border-l-foreground',
+export type CalloutTone = 'info' | 'success' | 'warning' | 'error'
+
+const TONE_META: Record<CalloutTone, { icon: typeof Info; classes: string }> = {
+  info: { icon: Info, classes: 'border-border bg-muted/40 text-foreground' },
+  success: {
+    icon: CheckCircle2,
+    classes: 'border-success/30 bg-success/10 text-foreground',
+  },
+  warning: {
+    icon: AlertTriangle,
+    classes: 'border-warning/30 bg-warning/10 text-foreground',
+  },
+  error: {
+    icon: XCircle,
+    classes: 'border-destructive/30 bg-destructive/10 text-foreground',
+  },
 }
-export function Callout({
-  state,
-  title,
-  quote,
-  action,
-  children,
-  className,
-}: {
-  state: State
-  title: ReactNode
-  /** What the other system said, verbatim. */ quote?: ReactNode
-  action?: ReactNode
-  children?: ReactNode
+
+export interface CalloutProps {
+  tone?: CalloutTone
+  title?: ReactNode
+  children: ReactNode
   className?: string
-}) {
+}
+
+/** A tone-only inline notice — for in-page banners, not toasts. See RULES.md § Notifications. */
+export function Callout({ tone = 'info', title, children, className }: CalloutProps) {
+  const meta = TONE_META[tone]
+  const Icon = meta.icon
   return (
     <div
-      role={state === 'error' ? 'alert' : 'status'}
-      className={cn('border-l-2 py-1 pl-4 text-xs', RULE[state], className)}
+      role={tone === 'error' ? 'alert' : 'status'}
+      className={cn('flex gap-3 rounded-md border p-3 text-sm', meta.classes, className)}
     >
-      <div className="flex min-w-0 flex-wrap items-start gap-x-4 gap-y-2">
-        <div className="min-w-0 flex-1 space-y-1.5">
-          <p
-            className={cn(
-              'flex items-baseline gap-2 text-sm font-semibold leading-5',
-              GLYPH_CLASS[state]
-            )}
-          >
-            <span aria-hidden className="w-3 text-center">
-              {GLYPH[state]}
-            </span>
-            <span className="min-w-0">{title}</span>
-          </p>
-          {quote && (
-            <p className="op-inset px-3 py-1.5 font-mono text-[11px] leading-5 text-foreground">
-              {quote}
-            </p>
-          )}
-          {children && <p className="text-muted-foreground">{children}</p>}
-        </div>
-        {action && (
-          <div className="flex shrink-0 items-center gap-2 sm:pt-0.5">
-            {action}
-          </div>
-        )}
+      <Icon className="mt-0.5 size-4 shrink-0" aria-hidden />
+      <div className="space-y-1">
+        {title ? <p className="font-medium">{title}</p> : null}
+        <div className="text-muted-foreground">{children}</div>
       </div>
     </div>
   )

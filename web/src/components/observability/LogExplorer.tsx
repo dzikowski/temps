@@ -3,7 +3,13 @@
 import { HighlightedCode } from '@/components/ui/code-block'
 import { AnsiLogMessage } from './AnsiLogMessage'
 
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import {
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from 'react'
 import type { GlobalLogLine } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
@@ -15,8 +21,10 @@ import {
   TableHead,
   TableCell,
 } from '@/components/ui/table'
-import { Download, WrapText, X, Columns3 } from 'lucide-react'
+import { Download, WrapText, X, Columns3, ListFilter } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { logEnvironmentLabel } from '@/lib/log-environment'
+import { LogLevelBadge } from '@temps-sdk/ds'
 
 import { Input } from '@/components/ui/input'
 import {
@@ -30,22 +38,28 @@ import { groupLogLines } from '@/lib/log-explorer'
 
 type Patch = Record<string, string | undefined>
 const identity = (line: GlobalLogLine) => `${line.chunk_id}:${line.line_offset}`
-const tone = (level: string) =>
-  level === 'ERROR'
-    ? 'text-destructive'
-    : level === 'WARN'
-      ? 'text-amber-600 dark:text-amber-400'
-      : 'text-muted-foreground'
+
+// Keep the default panel visibility aligned with the two-column layout.
+const desktopQuery = '(min-width: 1280px)'
+function subscribeDesktop(onChange: () => void) {
+  const query = window.matchMedia(desktopQuery)
+  query.addEventListener('change', onChange)
+  return () => query.removeEventListener('change', onChange)
+}
+const desktopSnapshot = () => window.matchMedia(desktopQuery).matches
+const serverDesktopSnapshot = () => true
 
 /** Dense cross-project log list with page-scoped facets and an adjacent record inspector. */
 export function LogExplorer({
   lines,
+  environmentLabels = {},
   onFilter,
   toolbar,
   footer,
   status,
   onInspect,
 }: {
+  environmentLabels?: Record<string, string>
   lines: GlobalLogLine[]
   onFilter: (patch: Patch) => void
   toolbar?: ReactNode
@@ -78,7 +92,15 @@ export function LogExplorer({
   const inspector = useRef<HTMLHeadingElement>(null)
   const opener = useRef<HTMLButtonElement | null>(null)
   const [selected, setSelected] = useState<string>()
-  const [wrap, setWrap] = useState(false)
+  const wrap = params.get('wrap') === '1'
+  const isDesktop = useSyncExternalStore(
+    subscribeDesktop,
+    desktopSnapshot,
+    serverDesktopSnapshot
+  )
+  const facetPreference = params.get('facets')
+  const showFacets =
+    facetPreference === '1' || (facetPreference !== '0' && isDesktop)
   useEffect(() => {
     if (selected) inspector.current?.focus()
   }, [selected])
@@ -107,7 +129,10 @@ export function LogExplorer({
       key: 'env',
       values: lines
         .filter((entry) => entry.env)
-        .map((entry) => ({ value: entry.env, label: entry.env })),
+        .map((entry) => ({
+          value: entry.env,
+          label: logEnvironmentLabel(entry.env, environmentLabels),
+        })),
     },
     {
       title: 'Node',
@@ -155,15 +180,33 @@ export function LogExplorer({
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
   return (
-    <div className="grid min-w-0 items-start gap-5 xl:grid-cols-[minmax(0,1fr)_264px]">
+    <div
+      className={cn(
+        'grid min-w-0 items-start gap-5',
+        (line || showFacets) && 'xl:grid-cols-[minmax(0,1fr)_264px]'
+      )}
+    >
       <section aria-label="Log explorer" className="min-w-0">
         {toolbar}
-        <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-y py-2">
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-2 pb-3">
           <span className="text-xs text-muted-foreground">
             {lines.length} loaded {lines.length === 1 ? 'line' : 'lines'} ·
             newest first
           </span>
           <div className="flex flex-wrap items-center gap-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-expanded={showFacets && !line}
+              aria-controls="log-facets"
+              onClick={() => {
+                setSelected(undefined)
+                presentation('facets', showFacets && !line ? '0' : '1')
+              }}
+            >
+              <ListFilter className="mr-1.5 size-3.5" />
+              Filters
+            </Button>
             <div
               role="group"
               aria-label="Log presentation"
@@ -220,7 +263,7 @@ export function LogExplorer({
               variant="ghost"
               size="sm"
               aria-pressed={wrap}
-              onClick={() => setWrap((value) => !value)}
+              onClick={() => presentation('wrap', wrap ? '0' : '1')}
             >
               <WrapText className="mr-1.5 size-3.5" />
               Wrap
@@ -237,15 +280,15 @@ export function LogExplorer({
             </Button>
           </div>
         </div>
-        {status}
+        {status && <div className="mb-3">{status}</div>}
         {(!status || lines.length > 0) &&
           (mode !== 'list' ? (
-            <div className="border-x border-b">
-              <p className="border-b px-3 py-2 text-xs text-muted-foreground">
+            <div className="overflow-hidden rounded-md border">
+              <p className="px-4 py-3 text-xs text-muted-foreground">
                 {mode === 'patterns' ? 'Exact repeated messages' : 'Services'}{' '}
                 on this loaded page. Select a row to inspect an example.
               </p>
-              <Table>
+              <Table className="table-fixed">
                 <TableHeader>
                   <TableRow>
                     <TableHead>
@@ -257,11 +300,17 @@ export function LogExplorer({
                 </TableHeader>
                 <TableBody>
                   {groups.map((group) => (
-                    <TableRow key={group.id}>
+                    <TableRow
+                      key={group.id}
+                      className="border-0 even:bg-muted/20"
+                    >
                       <TableCell className="max-w-sm">
                         <button
                           type="button"
-                          className="w-full truncate text-left font-mono text-[11px] hover:underline"
+                          className={cn(
+                            'block w-full text-left font-mono text-[11px] hover:underline',
+                            wrap ? 'whitespace-pre-wrap break-all' : 'truncate'
+                          )}
                           onClick={(event) => {
                             opener.current = event.currentTarget
                             onInspect?.()
@@ -283,9 +332,9 @@ export function LogExplorer({
               </Table>
             </div>
           ) : (
-            <div className="border-x border-b [&>div]:max-h-[62vh]">
+            <div className="overflow-hidden rounded-md border [&>div]:max-h-[62vh]">
               <Table className="table-fixed">
-                <TableHeader className="sticky top-0 z-10 bg-muted/70 [&_th]:h-8 [&_th]:text-[10px] [&_th]:uppercase [&_th]:tracking-wide">
+                <TableHeader className="sticky top-0 z-10 bg-muted [&_th]:h-8 [&_th]:text-[10px] [&_th]:uppercase [&_th]:tracking-wide">
                   <TableRow>
                     <TableHead className="hidden w-24 md:table-cell">
                       Time
@@ -313,6 +362,7 @@ export function LogExplorer({
                   {lines.map((entry) => (
                     <TableRow
                       key={identity(entry)}
+                      className="border-0 even:bg-muted/20"
                       data-state={
                         selected === identity(entry) ? 'selected' : undefined
                       }
@@ -326,13 +376,8 @@ export function LogExplorer({
                           { hour12: false, timeZone: 'UTC' }
                         )}
                       </TableCell>
-                      <TableCell
-                        className={cn(
-                          'py-1.5 font-mono text-[11px]',
-                          tone(entry.level)
-                        )}
-                      >
-                        {entry.level}
+                      <TableCell className="py-1.5 font-mono text-[11px]">
+                        <LogLevelBadge level={entry.level} />
                       </TableCell>
                       <TableCell className="hidden py-1.5 md:table-cell">
                         <p
@@ -377,7 +422,10 @@ export function LogExplorer({
                               ? entry.deploy_id
                               : column === 'node'
                                 ? entry.node_name
-                                : entry.env) ?? '—'}
+                                : logEnvironmentLabel(
+                                    entry.env,
+                                    environmentLabels
+                                  )) ?? '—'}
                           </TableCell>
                         ))}
                     </TableRow>
@@ -413,9 +461,9 @@ export function LogExplorer({
               <X className="size-4" />
             </Button>
           </div>
-          <p className={cn('mb-1 font-mono text-xs', tone(line.level))}>
-            {line.level}
-          </p>
+          <div className="mb-1">
+            <LogLevelBadge level={line.level} />
+          </div>
           <time
             className="text-xs text-muted-foreground"
             dateTime={line.timestamp}
@@ -434,7 +482,7 @@ export function LogExplorer({
           <dl className="my-4 space-y-3 text-xs">
             {[
               ['Source', line.owner],
-              ['Environment', line.env],
+              ['Environment', logEnvironmentLabel(line.env, environmentLabels)],
               ['Service', line.service],
               ['Node', line.node_name],
               ['Container', line.container_id],
@@ -460,8 +508,12 @@ export function LogExplorer({
             </>
           )}
         </aside>
-      ) : (
-        <aside aria-label="Log facets" className="space-y-5 xl:sticky xl:top-4">
+      ) : showFacets ? (
+        <aside
+          id="log-facets"
+          aria-label="Log facets"
+          className="space-y-5 xl:sticky xl:top-4"
+        >
           <div>
             <h2 className="text-sm font-semibold">Facets</h2>
             <p className="mt-1 text-xs text-muted-foreground">
@@ -495,7 +547,7 @@ export function LogExplorer({
                 <section
                   key={facet.key}
                   aria-label={`${facet.title} facets`}
-                  className="border-t pt-3"
+                  className="space-y-1"
                 >
                   <h3 className="mb-1 text-xs font-medium text-muted-foreground">
                     {facet.title}
@@ -507,7 +559,7 @@ export function LogExplorer({
                         key={value}
                         variant="ghost"
                         size="sm"
-                        className="relative flex h-7 w-full justify-between gap-2 overflow-hidden rounded-none border-b px-2 text-[11px]"
+                        className="relative flex h-7 w-full justify-between gap-2 overflow-hidden rounded-md px-2 text-[11px]"
                         onClick={() =>
                           onFilter({
                             [facet.key]: value,
@@ -541,7 +593,7 @@ export function LogExplorer({
             )
           })}
         </aside>
-      )}
+      ) : null}
     </div>
   )
 }

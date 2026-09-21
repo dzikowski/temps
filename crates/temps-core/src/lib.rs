@@ -20,6 +20,7 @@ pub mod error_metrics;
 pub mod external_plugin;
 pub mod feature_maturity;
 pub mod jobs;
+pub mod log_storage_config;
 pub mod managed_backup_schedule;
 pub mod node_pki;
 pub mod notifications;
@@ -56,7 +57,11 @@ pub mod time_window;
 pub mod tls;
 pub mod traces;
 pub mod update_status;
-pub use docker_handle::{DockerHandle, DockerUnavailable, CONTROL_PLANE_DOCKER_REASON};
+pub use docker_handle::{
+    worker_node_required_problem, DockerHandle, DockerUnavailable, CONTROL_PLANE_DOCKER_REASON,
+    WORKER_NODE_REQUIRED_ERROR_CODE, WORKER_NODE_REQUIRED_REMEDY, WORKER_NODE_REQUIRED_TITLE,
+    WORKER_NODE_REQUIRED_TYPE, WORKER_NODE_SETUP_PATH,
+};
 pub use problemdetails::ProblemDetails;
 pub use self_update::{
     ReleaseCheckResult, SelfUpdateAttempt, SelfUpdateBlocker, SelfUpdateCapability,
@@ -106,6 +111,7 @@ pub use env_vars_provider::{
 pub use error::*;
 pub use error_builder::*;
 pub use jobs::*;
+pub use log_storage_config::LogStorageConfig;
 pub use managed_backup_schedule::{
     ManagedBackupArchiveConflict, ManagedBackupSchedule, ManagedBackupScheduleError,
     ManagedBackupScheduleProvisioner, ReleasedManagedBackupSchedules,

@@ -62,6 +62,11 @@ export type ActiveVisitorsResponse = {
     window_minutes: number;
 };
 
+export type ActivityCategory = {
+    description: string;
+    name: string;
+};
+
 /**
  * Daily activity count for a single day
  */
@@ -155,6 +160,37 @@ export type ActivityEvent = {
     visitor_id?: number | null;
 };
 
+export type ActivityEvidence = {
+    event: string;
+    path: string;
+    properties: Array<ActivityProperty>;
+    /**
+     * Local to this report, not a database event ID.
+     */
+    reference: number;
+    timestamp: string;
+    title?: string | null;
+};
+
+export type ActivityGoal = {
+    goal: string;
+    missing_signals: string;
+    rationale: string;
+    title: string;
+};
+
+export type ActivityGoals = {
+    goals: Array<ActivityGoal>;
+    model: string;
+    pages_read: Array<string>;
+};
+
+export type ActivityGoalsRequest = {
+    environment_id?: number | null;
+    share_with_ai: boolean;
+    url: string;
+};
+
 /**
  * Query parameters for activity graph endpoint
  */
@@ -193,6 +229,103 @@ export type ActivityGraphResponse = {
      * Total count of activities across all days
      */
     total_count: number;
+};
+
+export type ActivityPreview = {
+    report: ActivityReport;
+    settings: ActivitySettings;
+};
+
+/**
+ * An unsaved onboarding preview. Sharing is explicit and scheduling is never inferred.
+ */
+export type ActivityPreviewRequest = {
+    environment_id?: number | null;
+    goal: string;
+    min_page_paths?: number;
+    min_sessions?: number;
+    property_keys?: Array<string>;
+    share_activity_with_ai: boolean;
+    source_domain?: string | null;
+    source_url?: string | null;
+};
+
+export type ActivityProperty = {
+    key: string;
+    value: string;
+};
+
+export type ActivityReport = {
+    categories: Array<ActivityCategory>;
+    completed_at: string;
+    environment_id?: number | null;
+    events_considered: number;
+    model?: string | null;
+    sampled: boolean;
+    settings_revision: number;
+    skipped_low_activity?: number;
+    skipped_unchanged?: number;
+    started_at: string;
+    summary: string;
+    visitors: Array<VisitorActivityAssessment>;
+    window_end: string;
+    window_start: string;
+};
+
+export type ActivityRunSummary = {
+    analyzed_visitors: number;
+    completed_at: string;
+    environment_id?: number | null;
+    error?: string | null;
+    model?: string | null;
+    skipped_low_activity: number;
+    skipped_unchanged: number;
+    skipped_visitors: number;
+    started_at: string;
+    status: string;
+    trigger: string;
+};
+
+export type ActivitySettings = {
+    application_context: string;
+    categories: Array<ActivityCategory>;
+    daily_enabled: boolean;
+    environment_id?: number | null;
+    /**
+     * Short operator-facing label for the selected analysis goal.
+     */
+    goal_title?: string | null;
+    min_page_paths?: number;
+    min_sessions?: number;
+    /**
+     * Only these event-property keys may be sent to the provider.
+     */
+    property_keys: Array<string>;
+    /**
+     * Explicit permission to send the selected analytics fields to the configured AI provider.
+     */
+    share_activity_with_ai: boolean;
+    source_domain?: string | null;
+    source_url?: string | null;
+};
+
+export type ActivityStatus = {
+    ai_model?: string | null;
+    ai_provider?: string | null;
+    configured: boolean;
+    /**
+     * Whether tracked non-crawler visitor events exist in the previous 24 hours.
+     */
+    has_recent_activity: boolean;
+    last_error?: string | null;
+    next_run_at?: string | null;
+    recent_runs: Array<ActivityRunSummary>;
+    report?: null | ActivityReport;
+    running: boolean;
+    selected_environment_id?: number | null;
+    settings: ActivitySettings;
+    settings_revision: number;
+    setup_url: string;
 };
 
 /**
@@ -3731,6 +3864,26 @@ export type ComposePublicPort = {
     service: string;
 };
 
+export type ComposeSecurityCheck = 'extends' | 'include' | 'interpolation' | 'inline_services' | 'inline_sections' | 'inline_fields' | 'privileged' | 'docker_socket' | 'capabilities' | 'drop_capabilities' | 'security_options' | 'no_new_privileges' | 'devices' | 'device_rules' | 'gpu' | 'sysctls' | 'groups' | 'cgroup_parent' | 'runtime' | 'lifecycle_hooks' | 'provider' | 'container_name' | 'init' | 'host_network' | 'host_pid' | 'host_ipc' | 'host_uts' | 'host_cgroup' | 'host_user' | 'container_namespace' | 'network_mode' | 'external_networks' | 'network_names' | 'network_drivers' | 'network_options' | 'network_ipam' | 'external_links' | 'published_ports' | 'bind_mounts' | 'volume_drivers' | 'volume_network_filesystems' | 'volume_host_paths' | 'volume_options' | 'external_volumes' | 'volume_names' | 'volumes_from' | 'config_paths' | 'secret_paths' | 'external_configs' | 'external_secrets' | 'env_files' | 'label_files' | 'storage_options' | 'oom_killer' | 'service_shm' | 'aggregate_shm' | 'tmpfs' | 'ulimits' | 'pids' | 'memory' | 'logging' | 'blkio' | 'swap' | 'replicas' | 'remote_build' | 'build_context' | 'dockerfile' | 'build_privileged' | 'build_entitlements' | 'build_network' | 'build_ssh' | 'build_shm' | 'build_ulimits' | 'build_additional_contexts' | 'build_cache_from' | 'build_cache_to' | 'build_tags' | 'image_references' | 'build_image' | 'pull_policy';
+
+export type ComposeSecurityCheckDefinition = {
+    consequence: string;
+    group: string;
+    id: ComposeSecurityCheck;
+    label: string;
+};
+
+export type ComposeSecurityPolicy = {
+    disabled_checks?: Array<ComposeSecurityCheck>;
+};
+
+export type ComposeSecurityResponse = {
+    can_edit: boolean;
+    checks: Array<ComposeSecurityCheckDefinition>;
+    legacy_migration_pending: boolean;
+    policy: ComposeSecurityPolicy;
+};
+
 /**
  * The specific well-known service family a compose service's image matches,
  * when it matches one Temps can deploy as a managed `external_services` row
@@ -4923,10 +5076,10 @@ export type CreateEnvironmentVariableRequest = {
      */
     include_in_preview?: boolean;
     /**
-     * When true the variable is masked in list responses and can only be
-     * viewed through the permission-checked, audited per-variable reveal
-     * endpoint. Updates that omit the value preserve the existing ciphertext.
-     * The flag is one-way — secret vars cannot be demoted to regular vars.
+     * When true the stored value is write-only: it is omitted from API
+     * responses and cannot be revealed, even by an administrator. Updates
+     * that omit the value preserve the existing ciphertext. The flag is
+     * one-way — secret vars cannot be demoted to regular vars.
      */
     is_secret?: boolean;
     key: string;
@@ -8355,20 +8508,25 @@ export type EnvironmentVariableResponse = {
      */
     include_in_preview: boolean;
     /**
-     * Whether the variable is a secret. Secrets always have `value: None` in
-     * list responses.
+     * Whether the stored value is write-only. Marked secrets always have
+     * `value: None` in API responses and cannot be revealed.
      */
     is_secret: boolean;
     key: string;
     updated_at: number;
     /**
-     * Plaintext value for non-secret vars (or `"***"` mask for list responses).
-     * `None` for secret vars; use the audited per-variable reveal endpoint.
+     * Plaintext for regular variables in create/update responses, or `"***"`
+     * in list responses. Always `None` for marked secrets. Only regular
+     * variables can be read through the audited per-variable reveal endpoint.
      */
     value?: string | null;
 };
 
 export type EnvironmentVariableValueResponse = {
+    /**
+     * Plaintext for a regular manual or integration-sourced variable.
+     * Marked secret manual variables never produce this response.
+     */
     value: string;
 };
 
@@ -10305,8 +10463,8 @@ export type GetEnvironmentVariablesQuery = {
      */
     service_id?: number | null;
     /**
-     * Exact manual env-var row to reveal. Required by the dashboard so
-     * duplicate keys on disjoint environments cannot cross-reveal.
+     * Exact manual env-var row to read when it is not marked secret. Required
+     * by the dashboard so duplicate keys cannot select a different row.
      */
     var_id?: number | null;
 };
@@ -11656,6 +11814,8 @@ export type InstallPluginResponse = {
 export type InstallRepositoryRequest = {
     grants?: null | PluginGrantConfig;
     name?: string | null;
+    path?: string | null;
+    progressId?: string | null;
     ref_name?: string | null;
     repository_url: string;
 };
@@ -13243,6 +13403,15 @@ export type MultiNodeSettings = {
      */
     node_disk_alert_percent?: number | null;
     /**
+     * Seconds a worker node must go without a heartbeat before its workloads
+     * are failed over to healthy nodes. A node is reported offline (and
+     * operators alerted) well before this; the gap is a grace period so a
+     * brief network partition or a control-plane stall does not redeploy a
+     * whole node's worth of apps that never stopped serving. `None` disables
+     * automatic failover entirely. Default 300.
+     */
+    node_failover_after_secs?: number | null;
+    /**
      * Memory-usage percent above which a worker node raises a resource alert.
      * `None` disables memory alerting. Default 90.
      */
@@ -13285,6 +13454,11 @@ export type MultiNodeSettingsMasked = {
      */
     node_cpu_alert_percent?: number | null;
     node_disk_alert_percent?: number | null;
+    /**
+     * Seconds without a heartbeat before a node's workloads are failed over;
+     * `None` = automatic failover disabled.
+     */
+    node_failover_after_secs?: number | null;
     node_memory_alert_percent?: number | null;
     private_address?: string | null;
     /**
@@ -13427,6 +13601,47 @@ export type NixpacksPresetConfig = {
  * providers.
  */
 export type NixpacksProvider = '...' | 'node' | 'python' | 'rust' | 'go' | 'java' | 'php' | 'ruby' | 'deno' | 'elixir' | 'csharp' | 'fsharp' | 'dart' | 'swift' | 'zig' | 'scala' | 'haskell' | 'clojure' | 'crystal' | 'cobol' | 'gleam' | 'lunatic' | 'scheme' | 'static';
+
+/**
+ * Whether this installation can run a workload anywhere, and if not, why.
+ */
+export type NodeCapabilityResponse = {
+    /**
+     * Worker nodes that are active and heartbeating. Excludes the control
+     * plane, which `local_workloads` already reports.
+     */
+    active_worker_nodes: number;
+    /**
+     * Whether *this caller* can act on `setup_path`.
+     *
+     * The capability itself is readable by every authenticated session, but
+     * the remedy is not: the Worker Nodes page needs `SettingsRead` to list
+     * the node inventory and `SettingsWrite` to mint an enrollment token.
+     * Sending a caller without both to that page produces "Failed to load
+     * worker nodes" — an advertised fix that denies the user who followed it.
+     * Clients render a non-admin variant ("ask an administrator") when this
+     * is false rather than a dead link.
+     */
+    can_manage_nodes: boolean;
+    /**
+     * Whether the control plane itself may run containers, builds and
+     * managed services (false in the `control-plane` serve profile).
+     */
+    local_workloads: boolean;
+    /**
+     * Why nothing can be placed, when `schedulable` is false. Rendered
+     * verbatim by the client.
+     */
+    reason?: string | null;
+    /**
+     * Whether a workload can be placed at all.
+     */
+    schedulable: boolean;
+    /**
+     * Console path that fixes it: where an operator joins a worker node.
+     */
+    setup_path: string;
+};
 
 export type NodeContainerListResponse = {
     containers: Array<NodeContainerResponse>;
@@ -13675,6 +13890,13 @@ export type OidcProviderResponse = {
     id: number;
     issuer_url: string;
     jit_provisioning: boolean;
+    /**
+     * ADR-045 §4: true only for the provider Temps Cloud provisions for
+     * console access. The admin UI should disable edit/delete controls for
+     * such a row — the API itself refuses those requests regardless
+     * (`OidcError::ManagedByCloudEdit`/`ManagedByCloudDelete`).
+     */
+    managed_by_cloud: boolean;
     name: string;
     role_claim: string;
     scopes: string;
@@ -15370,6 +15592,7 @@ export type PluginSourceResponse = {
     builder_image: string;
     commit: string;
     kind: string;
+    path?: string | null;
     ref_name: string;
     repository_url: string;
     version: string;
@@ -15684,6 +15907,22 @@ export type ProblemDetails = {
      */
     type?: string | null;
 };
+
+export type ProgressSnapshot = {
+    elapsed_ms: number;
+    id: string;
+    stages: Array<ProgressStage>;
+    status: ProgressStatus;
+};
+
+export type ProgressStage = {
+    elapsed_ms: number;
+    message: string;
+    stage: string;
+    status: ProgressStatus;
+};
+
+export type ProgressStatus = 'running' | 'completed' | 'failed';
 
 export type ProjectAccessResponse = {
     created_at: string;
@@ -17562,6 +17801,12 @@ export type RepointContinuousArchiveSourceRequest = {
     new_s3_source_id: number;
 };
 
+export type RepositoryCatalogPermission = {
+    permission: PluginHostPermission;
+    reason: string;
+    required: boolean;
+};
+
 export type RepositoryCatalogPlugin = {
     author: string;
     category: string;
@@ -17571,8 +17816,15 @@ export type RepositoryCatalogPlugin = {
     latestVersion: string;
     logoUrl?: string | null;
     name: string;
+    path?: string | null;
+    /**
+     * Author-declared capabilities for display only; never used to grant access.
+     * None means the legacy catalog did not declare permissions.
+     */
+    permissions?: Array<RepositoryCatalogPermission>;
     platforms: Array<string>;
     readmeUrl?: string | null;
+    ref?: string | null;
     repository: string;
     screenshots: Array<RepositoryScreenshot>;
     summary: string;
@@ -17827,8 +18079,8 @@ export type ResolvePermissionRequest = {
 /**
  * One entry in the computed env-var view that merges manual and integration
  * sources and tags each result with its origin. `value_preview` is always
- * masked — plaintext must be fetched per-key via the existing reveal endpoint,
- * which is audit-logged.
+ * masked. Regular manual values and integration values can be fetched per-key
+ * through an audited endpoint; marked secret manual values are write-only.
  */
 export type ResolvedEnvVarResponse = {
     /**
@@ -22846,6 +23098,16 @@ export type UpdateCloudflareProviderRequest = {
     name?: string | null;
 };
 
+export type UpdateComposeSecurityRequest = {
+    acknowledge_legacy_migration?: boolean;
+    acknowledge_risks?: boolean;
+    /**
+     * Policy read by the editor; compared while holding the project lock.
+     */
+    expected_policy: ComposeSecurityPolicy;
+    policy: ComposeSecurityPolicy;
+};
+
 export type UpdateConfigBody = {
     config?: null | ProviderConfig;
 };
@@ -24214,6 +24476,13 @@ export type ViewsOverTimeQuery = {
     environment_id?: number | null;
     project_id: number;
     start_date: string;
+};
+
+export type VisitorActivityAssessment = {
+    categories: Array<string>;
+    evidence: Array<ActivityEvidence>;
+    explanation: string;
+    visitor_id: number;
 };
 
 export type VisitorDetails = {
@@ -29991,6 +30260,26 @@ export type OidcCallbackData = {
     url: '/auth/oidc/callback';
 };
 
+export type StartManagedCloudLoginData = {
+    body?: never;
+    path?: never;
+    query?: {
+        return_to?: string | null;
+    };
+    url: '/auth/oidc/cloud/login';
+};
+
+export type StartManagedCloudLoginErrors = {
+    /**
+     * This instance has no Cloud-managed console-access provider
+     */
+    404: unknown;
+    /**
+     * OIDC provider unreachable
+     */
+    503: unknown;
+};
+
 export type StartOidcLoginBySlugData = {
     body?: never;
     path: {
@@ -33024,6 +33313,14 @@ export type ListDomainsData = {
          * Search domains by name (substring match)
          */
         search?: string | null;
+        /**
+         * Allowlisted sort columns for the paginated domain collection.
+         */
+        sort_by?: 'created_at' | 'domain' | 'status' | 'expiration';
+        /**
+         * Sort direction (defaults to desc). Unknown expiration dates always sort last.
+         */
+        sort_order?: 'asc' | 'desc';
     };
     url: '/domains';
 };
@@ -41598,6 +41895,37 @@ export type GetUptimeHistoryResponses = {
 
 export type GetUptimeHistoryResponse = GetUptimeHistoryResponses[keyof GetUptimeHistoryResponses];
 
+export type NodeCapabilityGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/nodes/capability';
+};
+
+export type NodeCapabilityGetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeCapabilityGetResponses = {
+    /**
+     * Scheduling capability of this install
+     */
+    200: NodeCapabilityResponse;
+};
+
+export type NodeCapabilityGetResponse = NodeCapabilityGetResponses[keyof NodeCapabilityGetResponses];
+
 export type NodeMetricsGetRangeData = {
     body?: never;
     path: {
@@ -43703,7 +44031,16 @@ export type GetGenaiTraceData = {
          */
         trace_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Window start (RFC 3339); pair with end_time, max 31 days
+         */
+        start_time?: string;
+        /**
+         * Window end (RFC 3339); pair with start_time, max 31 days
+         */
+        end_time?: string;
+    };
     url: '/otel/genai/traces/{project_id}/{trace_id}';
 };
 
@@ -43839,7 +44176,16 @@ export type GetUnifiedTraceData = {
          */
         trace_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Window start (RFC 3339); pair with end_time, max 31 days
+         */
+        start_time?: string;
+        /**
+         * Window end (RFC 3339); pair with start_time, max 31 days
+         */
+        end_time?: string;
+    };
     url: '/otel/global/traces/{trace_id}';
 };
 
@@ -44815,7 +45161,16 @@ export type GetTraceData = {
          */
         trace_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Window start (RFC 3339); pair with end_time, max 31 days
+         */
+        start_time?: string;
+        /**
+         * Window end (RFC 3339); pair with start_time, max 31 days
+         */
+        end_time?: string;
+    };
     url: '/otel/traces/{project_id}/{trace_id}';
 };
 
@@ -46113,6 +46468,72 @@ export type SetAlternateSourcesResponses = {
 };
 
 export type SetAlternateSourcesResponse = SetAlternateSourcesResponses[keyof SetAlternateSourcesResponses];
+
+export type GetComposeSecurityData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/compose-security';
+};
+
+export type GetComposeSecurityErrors = {
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+};
+
+export type GetComposeSecurityResponses = {
+    200: ComposeSecurityResponse;
+};
+
+export type GetComposeSecurityResponse = GetComposeSecurityResponses[keyof GetComposeSecurityResponses];
+
+export type UpdateComposeSecurityData = {
+    body: UpdateComposeSecurityRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/compose-security';
+};
+
+export type UpdateComposeSecurityErrors = {
+    /**
+     * Invalid settings or missing acknowledgement
+     */
+    400: unknown;
+    /**
+     * Instance administrator required
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Policy changed; refresh before retrying
+     */
+    409: unknown;
+};
+
+export type UpdateComposeSecurityResponses = {
+    200: ComposeSecurityResponse;
+};
+
+export type UpdateComposeSecurityResponse = UpdateComposeSecurityResponses[keyof UpdateComposeSecurityResponses];
 
 export type GetProjectDeploymentsData = {
     body?: never;
@@ -47773,6 +48194,136 @@ export type SilenceAlarmResponses = {
      */
     200: unknown;
 };
+
+export type GetActivityStatusData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: {
+        environment_id?: number | null;
+    };
+    url: '/projects/{project_id}/analytics/activity';
+};
+
+export type GetActivityStatusResponses = {
+    200: ActivityStatus;
+};
+
+export type GetActivityStatusResponse = GetActivityStatusResponses[keyof GetActivityStatusResponses];
+
+export type SaveActivitySettingsData = {
+    body: ActivitySettings;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/activity';
+};
+
+export type SaveActivitySettingsResponses = {
+    /**
+     * Settings saved
+     */
+    204: void;
+};
+
+export type SaveActivitySettingsResponse = SaveActivitySettingsResponses[keyof SaveActivitySettingsResponses];
+
+export type SuggestActivityGoalsData = {
+    body: ActivityGoalsRequest;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/activity/goals';
+};
+
+export type SuggestActivityGoalsErrors = {
+    /**
+     * Invalid public URL or consent missing
+     */
+    400: unknown;
+    /**
+     * Access denied
+     */
+    403: unknown;
+    /**
+     * Busy
+     */
+    409: unknown;
+    /**
+     * Site scan or AI suggestion failed
+     */
+    502: unknown;
+    /**
+     * AI provider missing
+     */
+    503: unknown;
+};
+
+export type SuggestActivityGoalsResponses = {
+    200: ActivityGoals;
+};
+
+export type SuggestActivityGoalsResponse = SuggestActivityGoalsResponses[keyof SuggestActivityGoalsResponses];
+
+export type PreviewActivityReportData = {
+    body: ActivityPreviewRequest;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/activity/preview';
+};
+
+export type PreviewActivityReportErrors = {
+    /**
+     * Invalid goal or sharing disabled
+     */
+    400: unknown;
+    /**
+     * Access denied
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Analysis busy or preview cooling down
+     */
+    409: unknown;
+    /**
+     * AI preview failed
+     */
+    502: unknown;
+    /**
+     * AI provider not configured
+     */
+    503: unknown;
+};
+
+export type PreviewActivityReportResponses = {
+    200: ActivityPreview;
+};
+
+export type PreviewActivityReportResponse = PreviewActivityReportResponses[keyof PreviewActivityReportResponses];
+
+export type RunActivityReportData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/activity/run';
+};
+
+export type RunActivityReportResponses = {
+    200: ActivityReport;
+};
+
+export type RunActivityReportResponse = RunActivityReportResponses[keyof RunActivityReportResponses];
 
 export type ListAnalyticsIngestKeysData = {
     body?: never;
@@ -50232,7 +50783,7 @@ export type GetResolvedEnvironmentVariableValueData = {
 
 export type GetResolvedEnvironmentVariableValueErrors = {
     /**
-     * Plaintext secret access is not permitted
+     * Marked secret values are write-only
      */
     403: unknown;
     /**
@@ -50251,7 +50802,7 @@ export type GetResolvedEnvironmentVariableValueErrors = {
 
 export type GetResolvedEnvironmentVariableValueResponses = {
     /**
-     * Resolved environment variable value
+     * Regular manual or integration variable value
      */
     200: EnvironmentVariableValueResponse;
 };
@@ -50285,7 +50836,7 @@ export type GetEnvironmentVariableValueData = {
 
 export type GetEnvironmentVariableValueErrors = {
     /**
-     * Plaintext secret access is not permitted
+     * Marked secret values are write-only
      */
     403: unknown;
     /**
@@ -50304,7 +50855,7 @@ export type GetEnvironmentVariableValueErrors = {
 
 export type GetEnvironmentVariableValueResponses = {
     /**
-     * Environment variable value
+     * Regular environment variable value
      */
     200: EnvironmentVariableValueResponse;
 };
@@ -51118,6 +51669,10 @@ export type ListContainersErrors = {
      */
     404: unknown;
     /**
+     * A container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -51157,6 +51712,10 @@ export type GetContainerDetailErrors = {
      * Container not found
      */
     404: unknown;
+    /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -51205,6 +51764,10 @@ export type GetContainerEnvironmentVariableErrors = {
      * Container or environment variable not found
      */
     404: unknown;
+    /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -51301,6 +51864,10 @@ export type GetContainerMetricsErrors = {
      * Container not found
      */
     404: unknown;
+    /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -51443,6 +52010,10 @@ export type RestartContainerErrors = {
      */
     404: unknown;
     /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -51483,6 +52054,10 @@ export type StartContainerErrors = {
      */
     404: unknown;
     /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -51522,6 +52097,10 @@ export type StopContainerErrors = {
      * Container not found
      */
     404: unknown;
+    /**
+     * The container is placed on this process, which has no local Docker daemon
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -51564,6 +52143,10 @@ export type DeployFromImageErrors = {
      * Project or environment not found
      */
     404: unknown;
+    /**
+     * Claiming a local daemon image needs a local Docker daemon, which this process has none of
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -62458,6 +63041,30 @@ export type ListRepositoryPluginCatalogResponses = {
 };
 
 export type ListRepositoryPluginCatalogResponse = ListRepositoryPluginCatalogResponses[keyof ListRepositoryPluginCatalogResponses];
+
+export type GetRepositoryInstallProgressData = {
+    body?: never;
+    path: {
+        /**
+         * Client-generated installation UUID
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/x/plugins/install/progress/{id}';
+};
+
+export type GetRepositoryInstallProgressErrors = {
+    404: ProblemDetails;
+};
+
+export type GetRepositoryInstallProgressError = GetRepositoryInstallProgressErrors[keyof GetRepositoryInstallProgressErrors];
+
+export type GetRepositoryInstallProgressResponses = {
+    200: ProgressSnapshot;
+};
+
+export type GetRepositoryInstallProgressResponse = GetRepositoryInstallProgressResponses[keyof GetRepositoryInstallProgressResponses];
 
 export type InstallRepositoryData = {
     body: InstallRepositoryRequest;
