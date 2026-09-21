@@ -397,26 +397,30 @@ impl DownloadRepoJob {
             )
             .await?;
 
-            let git_url_owned = git_url.to_string();
-            let repo_dir_owned = repo_dir.to_path_buf();
-            let checkout_ref_owned = checkout_ref.clone();
-            tokio::task::spawn_blocking(move || {
+            const CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+            tokio::time::timeout(
+                CLONE_TIMEOUT,
                 temps_git::services::git_ops::sparse_clone_repo(
-                    &git_url_owned,
-                    &repo_dir_owned,
+                    git_url,
+                    repo_dir,
                     &subdirectory,
-                    Some(&checkout_ref_owned),
+                    Some(&checkout_ref),
                     None,
-                )
-            })
+                ),
+            )
             .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!("Git sparse clone task failed: {}", e))
+            .map_err(|_| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Git sparse clone of {}/{} timed out after {}s",
+                    self.repo_owner,
+                    self.repo_name,
+                    CLONE_TIMEOUT.as_secs()
+                ))
             })?
             .map_err(|e| {
                 WorkflowError::JobExecutionFailed(format!(
-                    "Failed to sparse-clone public repository: {}",
-                    e
+                    "Failed to sparse-clone public repository {}/{}: {}",
+                    self.repo_owner, self.repo_name, e
                 ))
             })?;
 
@@ -633,9 +637,13 @@ impl DownloadRepoJob {
             .await?;
 
             if !repo_dir.exists() || std::fs::read_dir(&repo_dir)?.next().is_none() {
-                return Err(WorkflowError::JobExecutionFailed(
-                    "Repository directory is empty".to_string(),
-                ));
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "Repository directory '{}' is empty after sparse-checking out '{}' for {}/{}",
+                    repo_dir.display(),
+                    subdirectory,
+                    self.repo_owner,
+                    self.repo_name
+                )));
             }
 
             self.log(context, "Repository validation passed".to_string())

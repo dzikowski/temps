@@ -1079,7 +1079,13 @@ function GitSettingsInline({
                       onCheckedChange={async (checked) => {
                         await saveGitField({
                           pull_only_root_directory: checked === true,
+                          ...(editing === 'directory'
+                            ? { directory: directoryDraft || './' }
+                            : {}),
                         })
+                        if (editing === 'directory') {
+                          close()
+                        }
                         toast.success(
                           checked === true
                             ? 'Deploy will pull only the root directory'

@@ -9,7 +9,7 @@
 use base64::Engine;
 use git2::{build::RepoBuilder, Cred, FetchOptions, RemoteCallbacks, Repository};
 use std::path::Path;
-use std::process::Command;
+use std::process::Stdio;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -336,7 +336,10 @@ pub fn validate_sparse_subdirectory(subdirectory: &str) -> Result<String, GitOps
 ///
 /// `credentials` is HTTP Basic (`username`, `token`) via a process-local
 /// `http.extraHeader` — the token is not written into the URL.
-pub fn sparse_clone_repo(
+///
+/// Callers that wrap this in `tokio::time::timeout` can drop the future to
+/// kill the in-flight `git` child (`kill_on_drop`).
+pub async fn sparse_clone_repo(
     url: &str,
     target_dir: &Path,
     subdirectory: &str,
@@ -353,7 +356,7 @@ pub fn sparse_clone_repo(
         reason,
     };
 
-    let mut clone = Command::new("git");
+    let mut clone = git_command();
     clone
         .env("GIT_TERMINAL_PROMPT", "0")
         .arg("clone")
@@ -363,11 +366,13 @@ pub fn sparse_clone_repo(
         clone.arg("--filter=blob:none");
     }
     apply_git_http_credentials(&mut clone, credentials);
-    clone.arg(url).arg(target_dir);
+    clone.arg("--").arg(url).arg(target_dir);
 
-    run_git(clone, &format!("clone {redacted_url} into {target}")).map_err(fail)?;
+    run_git(clone, &format!("clone {redacted_url} into {target}"))
+        .await
+        .map_err(fail)?;
 
-    let mut sparse = Command::new("git");
+    let mut sparse = git_command();
     sparse
         .env("GIT_TERMINAL_PROMPT", "0")
         .arg("-C")
@@ -375,11 +380,14 @@ pub fn sparse_clone_repo(
         .arg("sparse-checkout")
         .arg("set")
         .arg("--cone")
+        .arg("--")
         .arg(&subdirectory);
     apply_git_http_credentials(&mut sparse, credentials);
-    run_git(sparse, &format!("sparse-checkout set {subdirectory}")).map_err(fail)?;
+    run_git(sparse, &format!("sparse-checkout set {subdirectory}"))
+        .await
+        .map_err(fail)?;
 
-    let mut checkout = Command::new("git");
+    let mut checkout = git_command();
     checkout
         .env("GIT_TERMINAL_PROMPT", "0")
         .arg("-C")
@@ -393,12 +401,28 @@ pub fn sparse_clone_repo(
         checkout,
         &format!("checkout {}", checkout_ref.unwrap_or("HEAD")),
     )
+    .await
     .map_err(fail)?;
 
     Repository::open(target_dir).map_err(|e| fail(e.message().to_string()))
 }
 
-fn apply_git_http_credentials(command: &mut Command, credentials: Option<(&str, &str)>) {
+fn git_command() -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("git");
+    command.kill_on_drop(true);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    command
+}
+
+fn apply_git_http_credentials(
+    command: &mut tokio::process::Command,
+    credentials: Option<(&str, &str)>,
+) {
     let Some((username, token)) = credentials else {
         return;
     };
@@ -412,9 +436,10 @@ fn apply_git_http_credentials(command: &mut Command, credentials: Option<(&str, 
         );
 }
 
-fn run_git(mut command: Command, action: &str) -> Result<(), String> {
+async fn run_git(mut command: tokio::process::Command, action: &str) -> Result<(), String> {
     let output = command
         .output()
+        .await
         .map_err(|e| format!("failed to run git ({action}): {e}"))?;
     if output.status.success() {
         return Ok(());
@@ -700,8 +725,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_sparse_clone_local_repo_keeps_only_subdirectory() {
+    #[tokio::test]
+    async fn test_sparse_clone_local_repo_keeps_only_subdirectory() {
         let source_dir = TempDir::new().unwrap();
         let repo = Repository::init(source_dir.path()).unwrap();
         let sig = Signature::now("Test", "test@test.com").unwrap();
@@ -730,9 +755,42 @@ mod tests {
 
         let target_dir = TempDir::new().unwrap();
         let source_url = format!("file://{}", source_dir.path().display());
-        let result = sparse_clone_repo(&source_url, target_dir.path(), "apps/web", None, None);
+        let result = sparse_clone_repo(&source_url, target_dir.path(), "apps/web", None, None).await;
         assert!(result.is_ok(), "sparse clone failed: {:?}", result.err());
         assert!(target_dir.path().join("apps/web/index.html").exists());
         assert!(!target_dir.path().join("apps/api/main.go").exists());
+    }
+
+    #[tokio::test]
+    async fn test_sparse_clone_accepts_dash_prefixed_subdirectory() {
+        let source_dir = TempDir::new().unwrap();
+        let repo = Repository::init(source_dir.path()).unwrap();
+        let sig = Signature::now("Test", "test@test.com").unwrap();
+
+        std::fs::create_dir_all(source_dir.path().join("-site/app")).unwrap();
+        std::fs::write(source_dir.path().join("-site/app/index.html"), "site").unwrap();
+
+        {
+            let mut index = repo.index().unwrap();
+            index
+                .add_path(std::path::Path::new("-site/app/index.html"))
+                .unwrap();
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+        }
+
+        let target_dir = TempDir::new().unwrap();
+        let source_url = format!("file://{}", source_dir.path().display());
+        let result =
+            sparse_clone_repo(&source_url, target_dir.path(), "-site/app", None, None).await;
+        assert!(
+            result.is_ok(),
+            "dash-prefixed sparse clone failed: {:?}",
+            result.err()
+        );
+        assert!(target_dir.path().join("-site/app/index.html").exists());
     }
 }

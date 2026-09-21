@@ -5663,7 +5663,7 @@ impl GitProviderManagerTrait for GitProviderManager {
             let subdirectory_owned = subdirectory_owned.clone();
             let checkout_ref = checkout_ref.clone();
             let username = username.clone();
-            tokio::task::spawn_blocking(move || {
+            async move {
                 super::git_ops::sparse_clone_repo(
                     &clone_url,
                     &target_dir_owned,
@@ -5671,15 +5671,14 @@ impl GitProviderManagerTrait for GitProviderManager {
                     checkout_ref.as_deref(),
                     Some((username.as_str(), token.as_str())),
                 )
-            })
+                .await
+            }
         };
 
         let clone_result =
             match tokio::time::timeout(CLONE_TIMEOUT, run_sparse_clone(access_token.clone())).await
             {
-                Ok(joined) => joined.map_err(|e| {
-                    TraitError::CloneError(format!("Git sparse clone task failed: {}", e))
-                })?,
+                Ok(result) => result,
                 Err(_) => {
                     return Err(TraitError::CloneError(format!(
                         "Git sparse clone timed out after {}s",
@@ -5718,20 +5717,13 @@ impl GitProviderManagerTrait for GitProviderManager {
                     .map_err(|err| TraitError::DecryptionError(err.to_string()))?;
 
                 match tokio::time::timeout(CLONE_TIMEOUT, run_sparse_clone(refreshed)).await {
-                    Ok(joined) => {
-                        joined
-                            .map_err(|err| {
-                                TraitError::CloneError(format!(
-                                    "Git sparse clone retry task failed: {}",
-                                    err
-                                ))
-                            })?
-                            .map_err(|err| {
-                                TraitError::CloneError(format!(
-                                    "Failed to sparse clone after refresh: {}",
-                                    err
-                                ))
-                            })?;
+                    Ok(result) => {
+                        result.map_err(|err| {
+                            TraitError::CloneError(format!(
+                                "Failed to sparse clone after refresh: {}",
+                                err
+                            ))
+                        })?;
                     }
                     Err(_) => {
                         return Err(TraitError::CloneError(format!(
