@@ -329,10 +329,18 @@ pub fn validate_sparse_subdirectory(subdirectory: &str) -> Result<String, GitOps
     Ok(normalized)
 }
 
+/// Non-cone pattern that includes only `subdirectory` and nothing at the
+/// repository root. Cone mode always materializes root files; this flag is
+/// for the opposite case.
+fn sparse_checkout_pattern(subdirectory: &str) -> String {
+    format!("/{subdirectory}/")
+}
+
 /// Clone only `subdirectory` using git sparse-checkout (partial clone).
 ///
-/// libgit2 cannot do `--filter=blob:none` + cone sparse-checkout, so this
+/// libgit2 cannot do `--filter=blob:none` + sparse-checkout, so this
 /// shells out to `git`. `file://` remotes skip the filter (unsupported).
+/// Uses non-cone patterns so repository-root files are not checked out.
 ///
 /// `credentials` is HTTP Basic (`username`, `token`) via a process-local
 /// `http.extraHeader` — the token is not written into the URL.
@@ -379,9 +387,9 @@ pub async fn sparse_clone_repo(
         .arg(target_dir)
         .arg("sparse-checkout")
         .arg("set")
-        .arg("--cone")
+        .arg("--no-cone")
         .arg("--")
-        .arg(&subdirectory);
+        .arg(sparse_checkout_pattern(&subdirectory));
     apply_git_http_credentials(&mut sparse, credentials);
     run_git(sparse, &format!("sparse-checkout set {subdirectory}"))
         .await
@@ -760,6 +768,10 @@ mod tests {
         assert!(result.is_ok(), "sparse clone failed: {:?}", result.err());
         assert!(target_dir.path().join("apps/web/index.html").exists());
         assert!(!target_dir.path().join("apps/api/main.go").exists());
+        assert!(
+            !target_dir.path().join("README.md").exists(),
+            "non-cone sparse checkout must not materialize repository-root files"
+        );
     }
 
     #[tokio::test]
