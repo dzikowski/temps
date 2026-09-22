@@ -112,6 +112,32 @@ impl Drop for ArchiveUploadPermit {
     }
 }
 
+async fn ensure_local_archive_deployments_supported(state: &AppState) -> Result<(), Problem> {
+    let stateless = state
+        .config_service
+        .is_stateless_installation()
+        .await
+        .map_err(|error| {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Invalid Stateless Configuration")
+                .with_detail(format!(
+                    "Could not determine whether local archive deployments are supported: {error}"
+                ))
+        })?;
+    ensure_local_archive_deployments_supported_for_mode(stateless)
+}
+
+fn ensure_local_archive_deployments_supported_for_mode(stateless: bool) -> Result<(), Problem> {
+    if stateless {
+        return Err(problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Deployment Method Unavailable")
+            .with_detail(
+                "Uploaded source archives, static bundles, and Docker image tarballs require durable local storage and are unavailable on a stateless control plane. Push a prebuilt image to a registry and deploy it by image reference instead.",
+            ));
+    }
+    Ok(())
+}
+
 async fn read_bounded_multipart_text(
     mut field: axum::extract::multipart::Field<'_>,
     label: &str,
@@ -175,6 +201,7 @@ async fn rollback_uploaded_source(
     responses(
         (status = 202, description = "Source deployment started", body = RemoteDeploymentResponse),
         (status = 400, description = "Invalid source archive"),
+        (status = 409, description = "Deployment method unavailable in stateless mode"),
         (status = 404, description = "Project or environment not found")
     ),
     security(("bearer_auth" = []))
@@ -193,6 +220,7 @@ pub async fn deploy_from_uploaded_source(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
+    ensure_local_archive_deployments_supported(&state).await?;
     let upload_permit = ArchiveUploadPermit::acquire()?;
 
     let project = projects::Entity::find_by_id(project_id)
@@ -209,6 +237,11 @@ pub async fn deploy_from_uploaded_source(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {project_id} not found"))
         })?;
+    // ADR 045, before the upload is consumed or any row is written: the
+    // planner refuses this again (it is the enforcement point), but only after
+    // a deployment row exists, and a 500 on a failed plan is the wrong answer
+    // to "you are not allowed to do this".
+    super::docker_socket::guard_deploy(&project.slug, &auth)?;
     if !accepts_source_archive(project.source_type, project.allow_alternate_sources) {
         return Err(problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Project Type")
@@ -427,7 +460,7 @@ pub async fn deploy_from_uploaded_source(
 
     if let Err(error) = state
         .workflow_planner
-        .create_deployment_jobs(deployment.id)
+        .create_deployment_jobs(deployment.id, super::docker_socket::deploy_caller(&auth))
         .await
     {
         rollback_uploaded_source(&state, Some(deployment.id), Some(bundle.id), &absolute_path)
@@ -461,7 +494,7 @@ pub async fn deploy_from_uploaded_source(
     let environment_name = environment.name.clone();
     let deployment_id = deployment.id;
     tokio::spawn(async move {
-        crate::services::job_processor::JobProcessorService::gate_check_then_run(
+        let _ = crate::services::job_processor::JobProcessorService::gate_check_then_run(
             &db,
             &workflow_executor,
             &deployment_gate,
@@ -1037,6 +1070,11 @@ pub async fn deploy_from_image(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {} not found", project_id))
         })?;
+    // ADR 045, before anything is resolved or written: this project's
+    // containers receive `/var/run/docker.sock`, so the image and command in
+    // this request would run as host root. The planner refuses it again — it
+    // is the enforcement point — but only once a deployment row exists.
+    super::docker_socket::guard_deploy(&project.slug, &auth)?;
 
     // Reject cross-project or deleted environments before creating the
     // deployment. Runtime defaults come only from the project's persisted
@@ -1259,7 +1297,7 @@ pub async fn deploy_from_image(
     // 7. Create jobs using WorkflowPlanner
     let create_jobs_result = state
         .workflow_planner
-        .create_deployment_jobs(deployment.id)
+        .create_deployment_jobs(deployment.id, super::docker_socket::deploy_caller(&auth))
         .await;
 
     match create_jobs_result {
@@ -1281,7 +1319,7 @@ pub async fn deploy_from_image(
             let db = state.db.clone();
             let environment_name = environment.name.clone();
             tokio::spawn(async move {
-                crate::services::job_processor::JobProcessorService::gate_check_then_run(
+                let _ = crate::services::job_processor::JobProcessorService::gate_check_then_run(
                     &db,
                     &workflow_executor,
                     &deployment_gate,
@@ -1354,6 +1392,7 @@ pub async fn deploy_from_image(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Project, environment, or bundle not found"),
+        (status = 409, description = "Deployment method unavailable in stateless mode"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -1372,6 +1411,7 @@ pub async fn deploy_from_static(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
+    ensure_local_archive_deployments_supported(&state).await?;
 
     // Validate optional deploy-time health-check path override up front
     if let Some(ref path) = req.health_check_path {
@@ -1399,6 +1439,9 @@ pub async fn deploy_from_static(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {} not found", project_id))
         })?;
+    // ADR 045: see `deploy_from_image`. A static bundle still starts a
+    // container for this project, so it is refused on the same terms.
+    super::docker_socket::guard_deploy(&project.slug, &auth)?;
 
     // Verify project source type allows static file deployments
     if !project
@@ -1529,7 +1572,7 @@ pub async fn deploy_from_static(
     // 8. Create jobs using WorkflowPlanner
     let create_jobs_result = state
         .workflow_planner
-        .create_deployment_jobs(deployment.id)
+        .create_deployment_jobs(deployment.id, super::docker_socket::deploy_caller(&auth))
         .await;
 
     match create_jobs_result {
@@ -1551,7 +1594,7 @@ pub async fn deploy_from_static(
             let db = state.db.clone();
             let environment_name = environment.name.clone();
             tokio::spawn(async move {
-                crate::services::job_processor::JobProcessorService::gate_check_then_run(
+                let _ = crate::services::job_processor::JobProcessorService::gate_check_then_run(
                     &db,
                     &workflow_executor,
                     &deployment_gate,
@@ -1628,6 +1671,7 @@ pub async fn deploy_from_static(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Project or environment not found"),
+        (status = 409, description = "Deployment method unavailable in stateless mode"),
         (status = 413, description = "Image tarball too large"),
         (status = 500, description = "Internal server error")
     ),
@@ -1648,6 +1692,7 @@ pub async fn deploy_from_image_upload(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
+    ensure_local_archive_deployments_supported(&state).await?;
 
     // Validate optional deploy-time health-check path override up front
     if let Some(ref path) = query.health_check_path {
@@ -1675,6 +1720,9 @@ pub async fn deploy_from_image_upload(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {} not found", project_id))
         })?;
+    // ADR 045: see `deploy_from_image`. An uploaded image tarball is the same
+    // attacker-chosen image and command, arriving by a different route.
+    super::docker_socket::guard_deploy(&project.slug, &auth)?;
 
     // Verify project source type allows Docker image deployments
     if !project
@@ -2036,7 +2084,7 @@ pub async fn deploy_from_image_upload(
     // 13. Create jobs using WorkflowPlanner
     let create_jobs_result = state
         .workflow_planner
-        .create_deployment_jobs(deployment.id)
+        .create_deployment_jobs(deployment.id, super::docker_socket::deploy_caller(&auth))
         .await;
 
     match create_jobs_result {
@@ -2058,7 +2106,7 @@ pub async fn deploy_from_image_upload(
             let db = state.db.clone();
             let environment_name = environment.name.clone();
             tokio::spawn(async move {
-                crate::services::job_processor::JobProcessorService::gate_check_then_run(
+                let _ = crate::services::job_processor::JobProcessorService::gate_check_then_run(
                     &db,
                     &workflow_executor,
                     &deployment_gate,
@@ -2201,6 +2249,7 @@ pub async fn get_deployment_by_upload_request_id(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Project not found"),
+        (status = 409, description = "Deployment method unavailable in stateless mode"),
         (status = 413, description = "Bundle too large"),
         (status = 500, description = "Internal server error")
     ),
@@ -2220,6 +2269,7 @@ pub async fn upload_static_bundle(
         state.project_access_checker
     );
     project_scope_guard!(auth, project_id);
+    ensure_local_archive_deployments_supported(&state).await?;
     let _static_upload_permit = ArchiveUploadPermit::acquire()?;
 
     debug!("Uploading static bundle for project {}", project_id);
@@ -3137,6 +3187,65 @@ mod tests {
     fn health_check_path_rejects_overlong_path() {
         let long = format!("/{}", "a".repeat(2048));
         assert!(validate_health_check_path(&long).is_err());
+    }
+
+    #[test]
+    fn stateless_mode_rejects_local_archive_deployment_methods() {
+        let problem = ensure_local_archive_deployments_supported_for_mode(true)
+            .expect_err("stateless mode must reject local deployment inputs");
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem
+                .body
+                .get("title")
+                .and_then(serde_json::Value::as_str),
+            Some("Deployment Method Unavailable")
+        );
+        assert!(problem
+            .body
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|detail| detail.contains("prebuilt image")));
+    }
+
+    #[test]
+    fn local_mode_accepts_local_archive_deployment_methods() {
+        assert!(ensure_local_archive_deployments_supported_for_mode(false).is_ok());
+    }
+
+    #[test]
+    fn every_local_archive_handler_checks_stateless_mode_before_storage_or_database_work() {
+        let source = include_str!("remote_deployments.rs");
+        for handler_name in [
+            "deploy_from_uploaded_source",
+            "deploy_from_static",
+            "deploy_from_image_upload",
+            "upload_static_bundle",
+        ] {
+            let start = source
+                .find(&format!("pub async fn {handler_name}"))
+                .unwrap_or_else(|| panic!("handler {handler_name} should exist"));
+            let tail = &source[start + 1..];
+            let end = tail.find("pub async fn").unwrap_or(tail.len());
+            let body = &source[start..start + 1 + end];
+            let guard = body
+                .find("ensure_local_archive_deployments_supported(&state).await?")
+                .unwrap_or_else(|| panic!("handler {handler_name} must reject stateless mode"));
+            let first_database_or_storage_work = [
+                body.find("Entity::find"),
+                body.find("ArchiveUploadPermit::acquire"),
+                body.find("tokio::fs"),
+                body.find("multipart.next_field"),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(body.len());
+            assert!(
+                guard < first_database_or_storage_work,
+                "handler {handler_name} must reject stateless mode before database, file, or multipart work"
+            );
+        }
     }
 
     #[test]

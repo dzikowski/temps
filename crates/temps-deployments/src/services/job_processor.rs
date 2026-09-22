@@ -5,8 +5,9 @@ use crate::services::workflow_execution_service::WorkflowExecutionService;
 use crate::services::workflow_planner::WorkflowPlanner;
 use sea_orm::{
     sea_query::{Expr, LockType, Query},
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseTransaction, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend,
+    DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    TransactionTrait,
 };
 use serde_json;
 use std::collections::HashMap;
@@ -83,6 +84,7 @@ struct CommitInfo {
 enum DeploymentDuplicateKey {
     Commit(String),
     Image(String),
+    DurableCommand(uuid::Uuid),
 }
 
 enum DeploymentCreationOutcome {
@@ -99,6 +101,19 @@ enum DeploymentCreationOutcome {
         current_deployment_id: Option<i32>,
         newer_deployment_id: Option<i32>,
     },
+}
+
+pub(crate) const SERVER_RESTART_CANCELLED_REASON: &str = "Server restarted";
+const CONTROL_PLANE_RESTART_JOB_REASON: &str = "Control plane restarted while this job was running";
+pub(crate) const CONTROL_PLANE_RESTART_FAILED_REASON: &str =
+    "Control plane restarted during deployment";
+
+fn is_restart_interrupted_durable_deployment(deployment: &deployments::Model) -> bool {
+    matches!(deployment.state.as_str(), "cancelled" | "failed")
+        && matches!(
+            deployment.cancelled_reason.as_deref(),
+            Some(SERVER_RESTART_CANCELLED_REASON | CONTROL_PLANE_RESTART_FAILED_REASON)
+        )
 }
 
 /// Shared slot for the optional [`temps_core::DeploymentGate`] — see the
@@ -135,6 +150,30 @@ pub struct JobProcessorService {
 }
 
 impl JobProcessorService {
+    async fn settle_delivery(
+        queue: &Arc<dyn JobQueue>,
+        receipt: Option<temps_core::JobReceipt>,
+        result: Result<(), JobProcessorError>,
+        job_type: &'static str,
+    ) {
+        let Some(receipt) = receipt else {
+            if let Err(error) = result {
+                error!(job_type, error = %error, "Ephemeral deployment job failed");
+            }
+            return;
+        };
+        let settlement = match result {
+            Ok(()) => queue.acknowledge(receipt).await,
+            Err(error) => {
+                error!(job_type, error = %error, "Durable deployment job failed; recording retry or terminal failure");
+                queue.fail(receipt, error.to_string()).await
+            }
+        };
+        if let Err(error) = settlement {
+            error!(job_type, error = %error, "Failed to settle durable deployment job");
+        }
+    }
+
     /// Acquire the dedicated failover slot when this job is an automatic node
     /// recovery. Ordinary jobs return immediately without touching the
     /// semaphore, so webhook, manual, and drain-triggered deploys retain their
@@ -273,29 +312,43 @@ impl JobProcessorService {
         }
 
         let should_check_duplicate = recovery_of_deployment_id.is_some()
-            || matches!(&duplicate_key, DeploymentDuplicateKey::Commit(_));
+            || matches!(
+                &duplicate_key,
+                DeploymentDuplicateKey::Commit(_) | DeploymentDuplicateKey::DurableCommand(_)
+            );
         if should_check_duplicate {
             let duplicate_query = deployments::Entity::find()
                 .filter(deployments::Column::ProjectId.eq(project_id))
-                .filter(deployments::Column::EnvironmentId.eq(environment_id))
-                .filter(deployments::Column::State.is_in(vec![
-                    "pending",
-                    "running",
-                    "deploying",
-                    "built",
-                    "ready",
-                ]));
+                .filter(deployments::Column::EnvironmentId.eq(environment_id));
             let duplicate_query = if let Some(source_deployment_id) = recovery_of_deployment_id {
                 duplicate_query.filter(deployments::Column::Id.ne(source_deployment_id))
             } else {
                 duplicate_query
             };
-            let duplicate_query = match duplicate_key {
-                DeploymentDuplicateKey::Commit(commit) => {
-                    duplicate_query.filter(deployments::Column::CommitSha.eq(commit))
-                }
-                DeploymentDuplicateKey::Image(image) => {
-                    duplicate_query.filter(deployments::Column::ImageName.eq(image))
+            let duplicate_query = match &duplicate_key {
+                DeploymentDuplicateKey::Commit(commit) => duplicate_query
+                    .filter(deployments::Column::State.is_in(vec![
+                        "pending",
+                        "running",
+                        "deploying",
+                        "built",
+                        "ready",
+                    ]))
+                    .filter(deployments::Column::CommitSha.eq(commit.clone())),
+                DeploymentDuplicateKey::Image(image) => duplicate_query
+                    .filter(deployments::Column::State.is_in(vec![
+                        "pending",
+                        "running",
+                        "deploying",
+                        "built",
+                        "ready",
+                    ]))
+                    .filter(deployments::Column::ImageName.eq(image.clone())),
+                DeploymentDuplicateKey::DurableCommand(job_id) => {
+                    duplicate_query.filter(Expr::cust_with_values(
+                        "context_vars ->> 'durable_job_id' = $1",
+                        [job_id.to_string()],
+                    ))
                 }
             };
             if let Some(existing) = duplicate_query
@@ -307,15 +360,77 @@ impl JobProcessorService {
                     creation_error("check duplicate generations before creating", error)
                 })?
             {
-                let outcome = DeploymentCreationOutcome::Duplicate {
-                    deployment_id: existing.id,
-                    state: existing.state,
-                };
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|error| creation_error("finish duplicate validation for", error))?;
-                return Ok(outcome);
+                // Reconciliation makes interrupted work terminal before queue
+                // replay. That row records an incomplete attempt, so retain it
+                // as history and create a fresh generation with fresh jobs. If
+                // a retry is already active or completed, it sorts first and
+                // remains an ordinary duplicate, preventing two workflows.
+                if matches!(duplicate_key, DeploymentDuplicateKey::DurableCommand(_))
+                    && is_restart_interrupted_durable_deployment(&existing)
+                {
+                    let newer_generation = deployments::Entity::find()
+                        .filter(deployments::Column::ProjectId.eq(project_id))
+                        .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                        // Active work, successful generations, and an
+                        // operator-paused healthy generation all supersede an
+                        // older command. Failed/cancelled/stopped attempts do
+                        // not prove that the newer requested state was applied.
+                        .filter(deployments::Column::State.is_in(vec![
+                            "pending",
+                            "running",
+                            "deploying",
+                            "built",
+                            "ready",
+                            "completed",
+                            "deployed",
+                            "paused",
+                        ]))
+                        .filter(
+                            Condition::any()
+                                .add(deployments::Column::CreatedAt.gt(existing.created_at))
+                                .add(
+                                    Condition::all()
+                                        .add(deployments::Column::CreatedAt.eq(existing.created_at))
+                                        .add(deployments::Column::Id.gt(existing.id)),
+                                ),
+                        )
+                        .order_by_desc(deployments::Column::CreatedAt)
+                        .order_by_desc(deployments::Column::Id)
+                        .one(&transaction)
+                        .await
+                        .map_err(|error| {
+                            creation_error(
+                                "check newer generations before replaying interrupted command",
+                                error,
+                            )
+                        })?;
+                    if let Some(newer) = newer_generation {
+                        let outcome = DeploymentCreationOutcome::Duplicate {
+                            deployment_id: newer.id,
+                            state: newer.state,
+                        };
+                        transaction.commit().await.map_err(|error| {
+                            creation_error("finish stale replay validation for", error)
+                        })?;
+                        return Ok(outcome);
+                    }
+                    info!(
+                        project_id,
+                        environment_id,
+                        interrupted_deployment_id = existing.id,
+                        interrupted_state = %existing.state,
+                        "Replaying durable deployment command after an interrupted attempt"
+                    );
+                } else {
+                    let outcome = DeploymentCreationOutcome::Duplicate {
+                        deployment_id: existing.id,
+                        state: existing.state,
+                    };
+                    transaction.commit().await.map_err(|error| {
+                        creation_error("finish duplicate validation for", error)
+                    })?;
+                    return Ok(outcome);
+                }
             }
         }
 
@@ -590,12 +705,15 @@ impl JobProcessorService {
 
     pub async fn run(&mut self) -> Result<(), JobProcessorError> {
         debug!("Starting job processor service for deployments");
+        self.reconcile_interrupted_workflows().await?;
         debug!("Job processor initialized and ready to receive jobs");
 
         loop {
             debug!("🎧 Waiting for next job...");
-            match self.job_receiver.recv().await {
-                Ok(job) => {
+            match self.job_receiver.recv_delivery().await {
+                Ok(delivery) => {
+                    let receipt = delivery.receipt;
+                    let job = delivery.job;
                     info!("Processing job: {}", job);
                     debug!(
                         "Job details received at: {}",
@@ -611,6 +729,7 @@ impl JobProcessorService {
                             let db = Arc::clone(&self.db);
                             let git_provider_manager = Arc::clone(&self.git_provider_manager);
                             let queue = Arc::clone(&self.queue);
+                            let acknowledgement_queue = Arc::clone(&self.queue);
                             let deployment_gate = self.deployment_gate.read().await.clone();
                             let failover_recovery_semaphore =
                                 Arc::clone(&self.failover_recovery_semaphore);
@@ -638,12 +757,19 @@ impl JobProcessorService {
                                             error = %error,
                                             "Failover recovery could not acquire the dedicated deployment slot"
                                         );
+                                        Self::settle_delivery(
+                                            &acknowledgement_queue,
+                                            receipt,
+                                            Err(error),
+                                            "GitPushEvent",
+                                        )
+                                        .await;
                                         return;
                                     }
                                 };
 
                                 debug!("Starting async processing for GitPushEvent job");
-                                Self::process_git_push_event_job(
+                                let result = Self::process_git_push_event_job(
                                     workflow_planner,
                                     workflow_executor,
                                     db,
@@ -651,6 +777,13 @@ impl JobProcessorService {
                                     queue,
                                     deployment_gate,
                                     git_push_job,
+                                )
+                                .await;
+                                Self::settle_delivery(
+                                    &acknowledgement_queue,
+                                    receipt,
+                                    result,
+                                    "GitPushEvent",
                                 )
                                 .await;
                                 debug!("Completed async processing for GitPushEvent job");
@@ -675,12 +808,14 @@ impl JobProcessorService {
                             let workflow_executor = Arc::clone(&self.workflow_executor);
                             let db = Arc::clone(&self.db);
                             let queue = Arc::clone(&self.queue);
+                            let acknowledgement_queue = Arc::clone(&self.queue);
                             let deployment_gate = self.deployment_gate.read().await.clone();
                             let failover_recovery_semaphore =
                                 Arc::clone(&self.failover_recovery_semaphore);
                             let recovery_of_deployment_id = image_job.recovery_of_deployment_id;
                             let recovery_project_id = image_job.project_id;
                             let recovery_environment_id = image_job.target_environment_id;
+                            let durable_job_id = receipt.as_ref().map(|receipt| receipt.job_id);
 
                             tokio::spawn(async move {
                                 let recovery_permit = match Self::acquire_failover_recovery_permit(
@@ -701,17 +836,32 @@ impl JobProcessorService {
                                             error = %error,
                                             "Failover recovery could not acquire the dedicated deployment slot"
                                         );
+                                        Self::settle_delivery(
+                                            &acknowledgement_queue,
+                                            receipt,
+                                            Err(error),
+                                            "DeployImageRequested",
+                                        )
+                                        .await;
                                         return;
                                     }
                                 };
 
-                                Self::process_deploy_image_requested_job(
+                                let result = Self::process_deploy_image_requested_job(
                                     workflow_planner,
                                     workflow_executor,
                                     db,
                                     queue,
                                     deployment_gate,
                                     image_job,
+                                    durable_job_id,
+                                )
+                                .await;
+                                Self::settle_delivery(
+                                    &acknowledgement_queue,
+                                    receipt,
+                                    result,
+                                    "DeployImageRequested",
                                 )
                                 .await;
 
@@ -736,14 +886,22 @@ impl JobProcessorService {
                             let deployment_gate = self.deployment_gate.read().await.clone();
                             let failover_recovery_semaphore =
                                 Arc::clone(&self.failover_recovery_semaphore);
+                            let acknowledgement_queue = Arc::clone(&self.queue);
 
                             tokio::spawn(async move {
-                                Self::process_deployment_gate_recheck_job(
+                                let result = Self::process_deployment_gate_recheck_job(
                                     db,
                                     workflow_executor,
                                     deployment_gate,
                                     failover_recovery_semaphore,
                                     recheck_job,
+                                )
+                                .await;
+                                Self::settle_delivery(
+                                    &acknowledgement_queue,
+                                    receipt,
+                                    result,
+                                    "DeploymentGateRecheck",
                                 )
                                 .await;
                             });
@@ -756,6 +914,11 @@ impl JobProcessorService {
                                 "Deployment processor skipped event owned by another subscriber: {}",
                                 job
                             );
+                            if let Some(receipt) = receipt {
+                                if let Err(error) = self.queue.acknowledge(receipt).await {
+                                    error!(error = %error, "Failed to acknowledge skipped durable job");
+                                }
+                            }
                         }
                     }
                 }
@@ -767,6 +930,60 @@ impl JobProcessorService {
                 }
             }
         }
+    }
+
+    /// Make work interrupted by a control-plane replacement explicitly
+    /// terminal. Durable request replay then resolves through the existing
+    /// deployment deduplication fence instead of re-running partially applied
+    /// workflow side effects. A deployment already selected as the current
+    /// environment generation remains serving; only its stale running job rows
+    /// are closed.
+    async fn reconcile_interrupted_workflows(&mut self) -> Result<(), JobProcessorError> {
+        let result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                r#"
+WITH interrupted AS (
+    UPDATE deployment_jobs
+    SET status = 3,
+        finished_at = now(),
+        updated_at = now(),
+        error_message = COALESCE(error_message, $1)
+    WHERE status = 2
+    RETURNING deployment_id
+), affected AS (
+    SELECT DISTINCT deployment_id FROM interrupted
+)
+UPDATE deployments d
+SET state = 'failed',
+    finished_at = now(),
+    updated_at = now(),
+    cancelled_reason = COALESCE(cancelled_reason, $2)
+FROM affected a, environments e
+WHERE d.id = a.deployment_id
+  AND e.id = d.environment_id
+  AND d.state IN ('pending', 'running')
+  AND e.current_deployment_id IS DISTINCT FROM d.id
+"#,
+                [
+                    CONTROL_PLANE_RESTART_JOB_REASON.into(),
+                    CONTROL_PLANE_RESTART_FAILED_REASON.into(),
+                ],
+            ))
+            .await
+            .map_err(|error| {
+                JobProcessorError::DatabaseError(format!(
+                    "reconcile interrupted deployment workflows at startup: {error}"
+                ))
+            })?;
+        if result.rows_affected() > 0 {
+            warn!(
+                deployments_failed = result.rows_affected(),
+                "Marked interrupted deployments failed during startup reconciliation"
+            );
+        }
+        Ok(())
     }
 
     /// Process a `DeployImageRequested` job: deploy a prebuilt Docker image to
@@ -783,7 +1000,8 @@ impl JobProcessorService {
         queue: Arc<dyn JobQueue>,
         deployment_gate: Option<Arc<dyn temps_core::DeploymentGate>>,
         job: temps_core::DeployImageRequestedJob,
-    ) {
+        durable_job_id: Option<uuid::Uuid>,
+    ) -> Result<(), JobProcessorError> {
         use chrono::Utc;
         use sea_orm::PaginatorTrait;
 
@@ -796,14 +1014,17 @@ impl JobProcessorService {
             Ok(Some(p)) => p,
             Ok(None) => {
                 error!("DeployImageRequested: project {} not found", job.project_id);
-                return;
+                return Ok(());
             }
             Err(e) => {
                 error!(
                     "DeployImageRequested: db error loading project {}: {}",
                     job.project_id, e
                 );
-                return;
+                return Err(JobProcessorError::DatabaseError(format!(
+                    "load project {} for image deployment: {e}",
+                    job.project_id
+                )));
             }
         };
 
@@ -823,7 +1044,10 @@ impl JobProcessorService {
                     "DeployImageRequested: db error loading environments for project {}: {}",
                     job.project_id, e
                 );
-                return;
+                return Err(JobProcessorError::DatabaseError(format!(
+                    "load target environments for project {}: {e}",
+                    job.project_id
+                )));
             }
         };
 
@@ -833,7 +1057,7 @@ impl JobProcessorService {
                 job.project_id,
                 job.target_environment_id
             );
-            return;
+            return Ok(());
         }
 
         for environment in environments {
@@ -841,7 +1065,12 @@ impl JobProcessorService {
                 .filter(deployments::Column::ProjectId.eq(project.id))
                 .count(db.as_ref())
                 .await
-                .unwrap_or(0)
+                .map_err(|error| {
+                    JobProcessorError::DatabaseError(format!(
+                        "count deployments for project {}: {error}",
+                        project.id
+                    ))
+                })?
                 + 1;
             let deployment_slug = format!("{}-{}", project.slug, deployment_number);
 
@@ -872,10 +1101,12 @@ impl JobProcessorService {
                     "trigger": "failover_recovery",
                     "source": "docker_image",
                     "recovery_of_deployment_id": source_deployment_id,
+                    "durable_job_id": durable_job_id,
                 }),
                 None => serde_json::json!({
                     "trigger": "template_image",
-                    "source": "docker_image"
+                    "source": "docker_image",
+                    "durable_job_id": durable_job_id,
                 }),
             };
             let new_deployment = deployments::ActiveModel {
@@ -898,7 +1129,10 @@ impl JobProcessorService {
                     project.id,
                     environment.id,
                     job.recovery_of_deployment_id,
-                    DeploymentDuplicateKey::Image(job.image_ref.clone()),
+                    durable_job_id.map_or_else(
+                        || DeploymentDuplicateKey::Image(job.image_ref.clone()),
+                        DeploymentDuplicateKey::DurableCommand,
+                    ),
                     new_deployment,
                 )
                 .await
@@ -942,7 +1176,7 @@ impl JobProcessorService {
                         "DeployImageRequested: failed to create deployment for project {} env {}: {}",
                         project.id, environment.id, e
                     );
-                        continue;
+                        return Err(e);
                     }
                 };
 
@@ -961,7 +1195,19 @@ impl JobProcessorService {
             }));
             Self::send_post_commit_events(&queue, post_commit_events).await;
 
-            match workflow_planner.create_deployment_jobs(deployment.id).await {
+            // ADR 045: the authority that was checked when this job was
+            // queued (`trigger_image_deployment_as`), carried on the job
+            // itself. Absent on a job queued by an older build, which plans as
+            // an ordinary writer and is refused for a declared project.
+            let deploy_caller = if job.docker_socket_authorized {
+                temps_core::docker_socket_grant::DeployCaller::InstanceAdmin
+            } else {
+                temps_core::docker_socket_grant::DeployCaller::ProjectWriter
+            };
+            match workflow_planner
+                .create_deployment_jobs(deployment.id, deploy_caller)
+                .await
+            {
                 Ok(created_jobs) => {
                     info!(
                         "Created {} jobs for deployment {} from DeployImageRequested",
@@ -979,7 +1225,7 @@ impl JobProcessorService {
                         &environment.name,
                         deployment.id,
                     )
-                    .await;
+                    .await?;
                 }
                 Err(e) => {
                     error!(
@@ -998,10 +1244,12 @@ impl JobProcessorService {
                             "Failed to mark image deployment {} failed: {}",
                             deployment.id, e2
                         );
+                        return Err(e2);
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Fetch commit information from Git provider
@@ -1125,7 +1373,7 @@ impl JobProcessorService {
         project_id: i32,
         environment_name: &str,
         deployment_id: i32,
-    ) {
+    ) -> Result<(), JobProcessorError> {
         if let Some(gate) = deployment_gate {
             match gate
                 .check(project_id, environment_name, &deployment_id.to_string())
@@ -1137,7 +1385,7 @@ impl JobProcessorService {
                         "Deployment {} blocked pending an external gate: {}",
                         deployment_id, reason
                     );
-                    return;
+                    return Ok(());
                 }
                 Err(e) => {
                     // Fail-closed: a broken gate must never fail open.
@@ -1145,7 +1393,9 @@ impl JobProcessorService {
                         "Deployment gate check errored for deployment {} — blocking (fail-closed): {}",
                         deployment_id, e
                     );
-                    return;
+                    return Err(JobProcessorError::PipelineError(format!(
+                        "deployment gate check failed for deployment {deployment_id}: {e}"
+                    )));
                 }
             }
         }
@@ -1160,14 +1410,14 @@ impl JobProcessorService {
                     "Deployment {} was not admitted because it is no longer pending or its owner is being deleted",
                     deployment_id
                 );
-                return;
+                return Ok(());
             }
             Err(e) => {
                 error!(
                     "Failed to atomically admit deployment {}: {}",
                     deployment_id, e
                 );
-                return;
+                return Err(e);
             }
         }
         info!("Updated deployment {} status to Running", deployment_id);
@@ -1194,8 +1444,11 @@ impl JobProcessorService {
             let terminal_state = deployments::Entity::find_by_id(deployment_id)
                 .one(db.as_ref())
                 .await
-                .ok()
-                .flatten()
+                .map_err(|error| {
+                    JobProcessorError::DatabaseError(format!(
+                        "load deployment {deployment_id} after workflow failure: {error}"
+                    ))
+                })?
                 .map(|deployment| deployment.state)
                 .filter(|state| {
                     matches!(
@@ -1220,6 +1473,7 @@ impl JobProcessorService {
                 .await
             {
                 error!("Failed to update deployment status: {}", update_err);
+                return Err(update_err);
             }
         } else {
             info!(
@@ -1227,6 +1481,7 @@ impl JobProcessorService {
                 deployment_id
             );
         }
+        Ok(())
     }
 
     /// Handle a [`temps_core::DeploymentGateRecheckJob`] — re-evaluate the
@@ -1244,7 +1499,7 @@ impl JobProcessorService {
         deployment_gate: Option<Arc<dyn temps_core::DeploymentGate>>,
         failover_recovery_semaphore: Arc<Semaphore>,
         job: temps_core::DeploymentGateRecheckJob,
-    ) {
+    ) -> Result<(), JobProcessorError> {
         let deployment = match deployments::Entity::find_by_id(job.deployment_id)
             .one(db.as_ref())
             .await
@@ -1255,14 +1510,17 @@ impl JobProcessorService {
                     "DeploymentGateRecheck: deployment {} not found",
                     job.deployment_id
                 );
-                return;
+                return Ok(());
             }
             Err(e) => {
                 error!(
                     "DeploymentGateRecheck: db error loading deployment {}: {}",
                     job.deployment_id, e
                 );
-                return;
+                return Err(JobProcessorError::DatabaseError(format!(
+                    "load deployment {} for gate recheck: {e}",
+                    job.deployment_id
+                )));
             }
         };
 
@@ -1271,7 +1529,7 @@ impl JobProcessorService {
                 "DeploymentGateRecheck: deployment {} is no longer pending (state={}), ignoring",
                 deployment.id, deployment.state
             );
-            return;
+            return Ok(());
         }
 
         let environment =
@@ -1285,14 +1543,17 @@ impl JobProcessorService {
                         "DeploymentGateRecheck: environment {} for deployment {} not found",
                         deployment.environment_id, deployment.id
                     );
-                    return;
+                    return Ok(());
                 }
                 Err(e) => {
                     error!(
                     "DeploymentGateRecheck: db error loading environment {} for deployment {}: {}",
                     deployment.environment_id, deployment.id, e
                 );
-                    return;
+                    return Err(JobProcessorError::DatabaseError(format!(
+                        "load environment {} for gate-rechecked deployment {}: {e}",
+                        deployment.environment_id, deployment.id
+                    )));
                 }
             };
 
@@ -1315,7 +1576,7 @@ impl JobProcessorService {
                     error = %error,
                     "Gate-rechecked failover recovery could not acquire its deployment slot"
                 );
-                return;
+                return Err(error);
             }
         };
 
@@ -1328,7 +1589,7 @@ impl JobProcessorService {
             .await
             {
                 Ok(true) => {}
-                Ok(false) => return,
+                Ok(false) => return Ok(()),
                 Err(error) => {
                     error!(
                         project_id = deployment.project_id,
@@ -1338,7 +1599,7 @@ impl JobProcessorService {
                         error = %error,
                         "Failed to validate gate-rechecked failover recovery"
                     );
-                    return;
+                    return Err(error);
                 }
             }
         }
@@ -1351,8 +1612,9 @@ impl JobProcessorService {
             &environment.name,
             deployment.id,
         )
-        .await;
+        .await?;
         drop(recovery_permit);
+        Ok(())
     }
 
     async fn process_git_push_event_job(
@@ -1363,7 +1625,7 @@ impl JobProcessorService {
         queue: Arc<dyn JobQueue>,
         deployment_gate: Option<Arc<dyn temps_core::DeploymentGate>>,
         job: temps_core::GitPushEventJob,
-    ) {
+    ) -> Result<(), JobProcessorError> {
         process_git_push_event(
             workflow_planner,
             workflow_executor,
@@ -1373,7 +1635,7 @@ impl JobProcessorService {
             deployment_gate,
             job,
         )
-        .await;
+        .await
     }
 }
 
@@ -1825,7 +2087,7 @@ async fn process_git_push_event(
     queue: Arc<dyn JobQueue>,
     deployment_gate: Option<Arc<dyn temps_core::DeploymentGate>>,
     job: temps_core::GitPushEventJob,
-) {
+) -> Result<(), JobProcessorError> {
     info!(
         "🔥 Processing GitPushEvent job for owner: {}, repo: {}, branch: {:?}",
         job.owner, job.repo, job.branch
@@ -1845,14 +2107,17 @@ async fn process_git_push_event(
         Ok(Some(project)) => project,
         Ok(None) => {
             warn!("No project found for repository {}/{}", job.owner, job.repo);
-            return;
+            return Ok(());
         }
         Err(e) => {
             error!(
                 "Database error while finding project for {}/{}: {}",
                 job.owner, job.repo, e
             );
-            return;
+            return Err(JobProcessorError::DatabaseError(format!(
+                "find project {} for GitPushEvent: {e}",
+                job.project_id
+            )));
         }
     };
 
@@ -1869,7 +2134,10 @@ async fn process_git_push_event(
                 "Failed to resolve target environments for project {}: {}",
                 project.id, e
             );
-            return;
+            return Err(JobProcessorError::DatabaseError(format!(
+                "resolve target environments for project {}: {e}",
+                project.id
+            )));
         }
     };
 
@@ -1878,7 +2146,7 @@ async fn process_git_push_event(
             "No environments found for branch {:?} in project {}",
             job.branch, project.id
         );
-        return;
+        return Ok(());
     }
 
     use chrono::Utc;
@@ -1905,6 +2173,10 @@ async fn process_git_push_event(
             "Failed to update last_deployment for project {}: {}",
             project.id, e
         );
+        return Err(JobProcessorError::DatabaseError(format!(
+            "update last deployment timestamp for project {}: {e}",
+            project.id
+        )));
     }
 
     // Deploy to each environment that opts in. Each environment applies its own
@@ -1948,7 +2220,10 @@ async fn process_git_push_event(
                     "Failed to count deployments for project {}: {}",
                     project.id, e
                 );
-                continue;
+                return Err(JobProcessorError::DatabaseError(format!(
+                    "count deployments for project {}: {e}",
+                    project.id
+                )));
             }
         };
         let deployment_number = deployment_count + 1;
@@ -2040,6 +2315,7 @@ async fn process_git_push_event(
             commit_json: sea_orm::Set(commit_info.as_ref().map(|c| c.commit_json.clone())),
             deployment_config: sea_orm::Set(deployment_config_snapshot),
             upload_request_id: sea_orm::Set(None),
+            docker_socket_mounted: sea_orm::Set(false),
             created_at: sea_orm::Set(Utc::now()),
             updated_at: sea_orm::Set(Utc::now()),
         };
@@ -2094,7 +2370,7 @@ async fn process_git_push_event(
                         "Failed to create deployment for project {} environment {}: {}",
                         project.id, environment.id, e
                     );
-                    continue;
+                    return Err(e);
                 }
             };
 
@@ -2113,7 +2389,20 @@ async fn process_git_push_event(
         }));
         JobProcessorService::send_post_commit_events(&queue, post_commit_events).await;
 
-        let create_jobs_result = workflow_planner.create_deployment_jobs(deployment.id).await;
+        // ADR 045: a git push has no authenticated principal — it arrives from
+        // a provider webhook — so it deploys as the platform. What makes that
+        // safe is that the inputs it builds from are admin-controlled: on a
+        // project whose slug this control plane declares, the source
+        // repository fields and the runtime command are themselves
+        // instance-admin-only to change (see `ProjectService`). Without those
+        // guards a non-admin could repoint a granted project at their own
+        // repository and push, and this is where it would run as host root.
+        let create_jobs_result = workflow_planner
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .await;
         let deployment_id = deployment.id;
 
         match create_jobs_result {
@@ -2134,7 +2423,7 @@ async fn process_git_push_event(
                     &environment.name,
                     deployment_id,
                 )
-                .await;
+                .await?;
             }
             Err(job_error) => {
                 let error_message = format!("{}", job_error);
@@ -2152,10 +2441,12 @@ async fn process_git_push_event(
                 .await
                 {
                     error!("Failed to update deployment status: {}", update_err);
+                    return Err(update_err);
                 }
             }
         }
     } // end for environment in environments
+    Ok(())
 }
 
 /// Cancel all in-flight deployments for the given environment.
@@ -2265,7 +2556,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use mockall::mock;
-    use sea_orm::{ActiveModelTrait, Set};
+    use sea_orm::{ActiveModelTrait, PaginatorTrait, Set};
     use temps_core::QueueError;
     use temps_database::test_utils::TestDatabase;
     use temps_entities::preset::Preset;
@@ -2385,6 +2676,7 @@ mod tests {
             deployment_config: None,
             promoted_from_deployment_id: None,
             upload_request_id: None,
+            docker_socket_mounted: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -2937,6 +3229,461 @@ mod tests {
             .find(|deployment| deployment.id == routed.id)
             .expect("routed deployment remains");
         assert_eq!(routed.state, "running");
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_durable_image_delivery_creates_fresh_generation() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping interrupted durable replay regression test");
+            return;
+        }
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let durable_job_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let mut interrupted = generation_model(
+            project_id,
+            environment_id,
+            "interrupted-durable-image",
+            "cancelled",
+            "durable-image-request",
+            now,
+        );
+        interrupted.cancelled_reason = Set(Some(SERVER_RESTART_CANCELLED_REASON.to_string()));
+        interrupted.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+        let interrupted = interrupted
+            .insert(db.as_ref())
+            .await
+            .expect("insert interrupted durable deployment");
+
+        let mut replay = generation_model(
+            project_id,
+            environment_id,
+            "replayed-durable-image",
+            "pending",
+            "durable-image-request",
+            now,
+        );
+        replay.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+        let outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::DurableCommand(durable_job_id),
+            replay,
+        )
+        .await
+        .expect("replay interrupted durable deployment");
+
+        let replayed = match outcome {
+            DeploymentCreationOutcome::Created { deployment, .. } => deployment,
+            DeploymentCreationOutcome::Duplicate {
+                deployment_id,
+                state,
+            } => {
+                panic!("interrupted deployment {deployment_id} in {state} must not consume replay")
+            }
+            DeploymentCreationOutcome::StaleRecovery { .. } => {
+                panic!("ordinary durable replay cannot be stale recovery")
+            }
+        };
+        assert_ne!(replayed.id, interrupted.id);
+        assert_eq!(replayed.state, "pending");
+        let mut second_replay = generation_model(
+            project_id,
+            environment_id,
+            "second-replayed-durable-image",
+            "pending",
+            "durable-image-request",
+            now,
+        );
+        second_replay.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+        let second_outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::DurableCommand(durable_job_id),
+            second_replay,
+        )
+        .await
+        .expect("deduplicate second replay against active retry");
+        match second_outcome {
+            DeploymentCreationOutcome::Duplicate {
+                deployment_id,
+                state,
+            } => {
+                assert_eq!(deployment_id, replayed.id);
+                assert_eq!(state, "pending");
+            }
+            DeploymentCreationOutcome::Created { deployment, .. } => panic!(
+                "active durable retry must prevent a second workflow, created {}",
+                deployment.id
+            ),
+            DeploymentCreationOutcome::StaleRecovery { .. } => {
+                panic!("ordinary durable replay cannot be stale recovery")
+            }
+        }
+        let rows = deployments::Entity::find()
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .all(db.as_ref())
+            .await
+            .expect("load durable deployment attempts");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .find(|deployment| deployment.id == interrupted.id)
+                .expect("interrupted attempt remains as history")
+                .state,
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_restart_durable_image_delivery_creates_fresh_generation() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping failed durable replay regression test");
+            return;
+        }
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let durable_job_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let mut interrupted = generation_model(
+            project_id,
+            environment_id,
+            "failed-durable-image",
+            "failed",
+            "durable-image-request",
+            now,
+        );
+        interrupted.cancelled_reason = Set(Some(CONTROL_PLANE_RESTART_FAILED_REASON.to_string()));
+        interrupted.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+        let interrupted = interrupted
+            .insert(db.as_ref())
+            .await
+            .expect("insert failed durable deployment");
+        let mut replay = generation_model(
+            project_id,
+            environment_id,
+            "replayed-failed-durable-image",
+            "pending",
+            "durable-image-request",
+            now,
+        );
+        replay.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+
+        let outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::DurableCommand(durable_job_id),
+            replay,
+        )
+        .await
+        .expect("replay failed restart deployment");
+
+        match outcome {
+            DeploymentCreationOutcome::Created { deployment, .. } => {
+                assert_ne!(deployment.id, interrupted.id);
+                assert_eq!(deployment.state, "pending");
+            }
+            DeploymentCreationOutcome::Duplicate {
+                deployment_id,
+                state,
+            } => panic!(
+                "restart-failed deployment {deployment_id} in {state} must not consume replay"
+            ),
+            DeploymentCreationOutcome::StaleRecovery { .. } => {
+                panic!("ordinary durable replay cannot be stale recovery")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_durable_replay_does_not_supersede_newer_generation() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping stale durable replay regression test");
+            return;
+        }
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        // `paused` is an operator-controlled healthy generation and must be
+        // preserved just like active or successfully completed work.
+        for blocking_state in ["pending", "completed", "deployed", "paused"] {
+            deployments::Entity::delete_many()
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .exec(db.as_ref())
+                .await
+                .expect("clear prior blocking-state fixture");
+            let durable_job_id = uuid::Uuid::new_v4();
+            let now = Utc::now();
+            let mut interrupted = generation_model(
+                project_id,
+                environment_id,
+                "interrupted-old-command",
+                "cancelled",
+                "old-command",
+                now,
+            );
+            interrupted.cancelled_reason = Set(Some(SERVER_RESTART_CANCELLED_REASON.to_string()));
+            interrupted.context_vars = Set(Some(serde_json::json!({
+                "durable_job_id": durable_job_id,
+            })));
+            interrupted
+                .insert(db.as_ref())
+                .await
+                .expect("insert interrupted old command");
+            let newer = generation_model(
+                project_id,
+                environment_id,
+                "newer-manual-generation",
+                blocking_state,
+                "newer-command",
+                now + chrono::Duration::seconds(1),
+            )
+            .insert(db.as_ref())
+            .await
+            .expect("insert newer generation");
+            let mut replay = generation_model(
+                project_id,
+                environment_id,
+                "stale-command-replay",
+                "pending",
+                "old-command",
+                now,
+            );
+            replay.context_vars = Set(Some(serde_json::json!({
+                "durable_job_id": durable_job_id,
+            })));
+
+            let outcome = JobProcessorService::create_deployment_with_generation_fence(
+                db.as_ref(),
+                project_id,
+                environment_id,
+                None,
+                DeploymentDuplicateKey::DurableCommand(durable_job_id),
+                replay,
+            )
+            .await
+            .expect("reject stale durable replay");
+
+            match outcome {
+                DeploymentCreationOutcome::Duplicate {
+                    deployment_id,
+                    state,
+                } => {
+                    assert_eq!(deployment_id, newer.id);
+                    assert_eq!(state, blocking_state);
+                }
+                DeploymentCreationOutcome::Created { deployment, .. } => panic!(
+                    "stale durable command must not supersede newer {blocking_state} generation {}, created {}",
+                    newer.id, deployment.id
+                ),
+                DeploymentCreationOutcome::StaleRecovery { .. } => {
+                    panic!("ordinary durable replay cannot be failover recovery")
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_terminal_newer_generation_does_not_consume_interrupted_replay() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping terminal generation replay regression test");
+            return;
+        }
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+
+        for terminal_state in ["failed", "cancelled", "stopped"] {
+            deployments::Entity::delete_many()
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .exec(db.as_ref())
+                .await
+                .expect("clear prior terminal-state fixture");
+            let durable_job_id = uuid::Uuid::new_v4();
+            let now = Utc::now();
+            let mut interrupted = generation_model(
+                project_id,
+                environment_id,
+                "interrupted-old-command",
+                "cancelled",
+                "old-command",
+                now,
+            );
+            interrupted.cancelled_reason = Set(Some(SERVER_RESTART_CANCELLED_REASON.to_string()));
+            interrupted.context_vars = Set(Some(serde_json::json!({
+                "durable_job_id": durable_job_id,
+            })));
+            let interrupted = interrupted
+                .insert(db.as_ref())
+                .await
+                .expect("insert interrupted old command");
+            generation_model(
+                project_id,
+                environment_id,
+                "newer-terminal-generation",
+                terminal_state,
+                "newer-command",
+                now + chrono::Duration::seconds(1),
+            )
+            .insert(db.as_ref())
+            .await
+            .expect("insert newer terminal generation");
+            let mut replay = generation_model(
+                project_id,
+                environment_id,
+                "resumed-old-command",
+                "pending",
+                "old-command",
+                now,
+            );
+            replay.context_vars = Set(Some(serde_json::json!({
+                "durable_job_id": durable_job_id,
+            })));
+
+            let outcome = JobProcessorService::create_deployment_with_generation_fence(
+                db.as_ref(),
+                project_id,
+                environment_id,
+                None,
+                DeploymentDuplicateKey::DurableCommand(durable_job_id),
+                replay,
+            )
+            .await
+            .expect("resume interrupted command past terminal newer generation");
+
+            match outcome {
+                DeploymentCreationOutcome::Created { deployment, .. } => {
+                    assert_ne!(deployment.id, interrupted.id);
+                    assert_eq!(deployment.state, "pending");
+                }
+                DeploymentCreationOutcome::Duplicate {
+                    deployment_id,
+                    state,
+                } => panic!(
+                    "newer {terminal_state} deployment {deployment_id} in {state} must not consume interrupted replay"
+                ),
+                DeploymentCreationOutcome::StaleRecovery { .. } => {
+                    panic!("ordinary durable replay cannot be failover recovery")
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_completed_durable_image_delivery_remains_deduplicated() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping completed durable replay regression test");
+            return;
+        }
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let durable_job_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let mut completed = generation_model(
+            project_id,
+            environment_id,
+            "completed-durable-image",
+            "completed",
+            "durable-image-request",
+            now,
+        );
+        completed.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+        let completed = completed
+            .insert(db.as_ref())
+            .await
+            .expect("insert completed durable deployment");
+
+        let mut duplicate = generation_model(
+            project_id,
+            environment_id,
+            "duplicate-durable-image",
+            "pending",
+            "durable-image-request",
+            now,
+        );
+        duplicate.context_vars = Set(Some(serde_json::json!({
+            "durable_job_id": durable_job_id,
+        })));
+        let outcome = JobProcessorService::create_deployment_with_generation_fence(
+            db.as_ref(),
+            project_id,
+            environment_id,
+            None,
+            DeploymentDuplicateKey::DurableCommand(durable_job_id),
+            duplicate,
+        )
+        .await
+        .expect("deduplicate completed durable deployment");
+
+        match outcome {
+            DeploymentCreationOutcome::Duplicate {
+                deployment_id,
+                state,
+            } => {
+                assert_eq!(deployment_id, completed.id);
+                assert_eq!(state, "completed");
+            }
+            DeploymentCreationOutcome::Created { deployment, .. } => panic!(
+                "completed durable delivery must be reused, created {}",
+                deployment.id
+            ),
+            DeploymentCreationOutcome::StaleRecovery { .. } => {
+                panic!("ordinary durable replay cannot be stale recovery")
+            }
+        }
+        let count = deployments::Entity::find()
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .count(db.as_ref())
+            .await
+            .expect("count durable deployment attempts");
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
@@ -3589,7 +4336,10 @@ mod tests {
 
         // Test workflow planner creates jobs
         let jobs = workflow_planner
-            .create_deployment_jobs(deployment.id)
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
             .await?;
 
         // Verify jobs were created (nextjs project should create 10 jobs including
@@ -3706,7 +4456,10 @@ mod tests {
 
         // Create jobs - should skip download_repo
         let jobs = workflow_planner
-            .create_deployment_jobs(deployment.id)
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
             .await?;
 
         // Should create 4 jobs (no download_repo): build_image, deploy_container, persist_static_assets, mark_deployment_complete
@@ -3780,7 +4533,10 @@ mod tests {
 
         // Create jobs
         let jobs = workflow_planner
-            .create_deployment_jobs(deployment.id)
+            .create_deployment_jobs(
+                deployment.id,
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
             .await?;
 
         // Verify all jobs start as Pending

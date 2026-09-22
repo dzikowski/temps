@@ -80,6 +80,16 @@ pub struct DeployImageRequestedJob {
     /// See [`GitPushEventJob::recovery_of_deployment_id`].
     #[serde(default)]
     pub recovery_of_deployment_id: Option<i32>,
+    /// Whether the principal that asked for this deployment was allowed to
+    /// deploy a project holding host Docker access (ADR 045).
+    ///
+    /// The consumer plans the deployment long after the request is gone, so
+    /// it cannot re-derive the answer. `#[serde(default)]` is `false`: a job
+    /// queued before this field existed, or one that lost it in transit, is
+    /// planned as an ordinary project writer and refused for a declared
+    /// project rather than allowed by omission.
+    #[serde(default)]
+    pub docker_socket_authorized: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -573,6 +583,30 @@ pub enum QueueError {
     ChannelClosed,
     #[error("Invalid job data: {0}")]
     InvalidData(String),
+    #[error("Failed to persist job {job_type}: {details}")]
+    Persistence { job_type: String, details: String },
+    #[error("Durable queue is full ({pending}/{limit} pending jobs); rejected {job_type}")]
+    Saturated {
+        job_type: String,
+        pending: u64,
+        limit: u64,
+    },
+    #[error("Job {job_type} is unsupported in stateless mode: {guidance}")]
+    UnsupportedInStateless { job_type: String, guidance: String },
+}
+
+/// Identifies one consumer's durable copy of a broadcast job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobReceipt {
+    pub job_id: uuid::Uuid,
+    pub consumer: String,
+}
+
+/// A queue delivery. Ephemeral broadcast deliveries have no receipt.
+#[derive(Debug, Clone)]
+pub struct JobDelivery {
+    pub job: Job,
+    pub receipt: Option<JobReceipt>,
 }
 
 /// Core trait for job queue operations
@@ -583,6 +617,24 @@ pub trait JobQueue: Send + Sync {
 
     /// Create a new receiver for jobs
     fn subscribe(&self) -> Box<dyn JobReceiver>;
+
+    /// Subscribe with a stable consumer identity. Durable queue implementations
+    /// use this identity to maintain independent acknowledgements per consumer.
+    fn subscribe_durable(&self, _consumer: &'static str) -> Box<dyn JobReceiver> {
+        self.subscribe()
+    }
+
+    /// Acknowledge a durable delivery after its side effect has completed.
+    async fn acknowledge(&self, _receipt: JobReceipt) -> Result<(), QueueError> {
+        Ok(())
+    }
+
+    /// Record a failed durable delivery. Durable implementations release
+    /// transient failures for retry and persist a terminal failure after a
+    /// bounded number of attempts. Ephemeral queues have nothing to release.
+    async fn fail(&self, _receipt: JobReceipt, _details: String) -> Result<(), QueueError> {
+        Ok(())
+    }
 }
 
 /// Core trait for receiving jobs
@@ -590,6 +642,12 @@ pub trait JobQueue: Send + Sync {
 pub trait JobReceiver: Send {
     /// Receive the next job
     async fn recv(&mut self) -> Result<Job, QueueError>;
+
+    async fn recv_delivery(&mut self) -> Result<JobDelivery, QueueError> {
+        self.recv()
+            .await
+            .map(|job| JobDelivery { job, receipt: None })
+    }
 }
 
 #[cfg(test)]

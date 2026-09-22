@@ -21,6 +21,7 @@ use utoipa::openapi::OpenApi;
 
 use crate::log_archive::LogArchiveStorage;
 use crate::{DockerLogService, LogService, S3LogArchive};
+use temps_file_store::s3_config::StatelessStorage;
 
 /// Logs Plugin for file and Docker container logging
 pub struct LogsPlugin {
@@ -90,9 +91,28 @@ impl TempsPlugin for LogsPlugin {
                     "Build/deploy log archival to S3 enabled (TEMPS_LOG_STORAGE_BACKEND=s3)"
                 );
             }
-            let log_service = Arc::new(LogService::with_archive(
+            let config_service = context.require_service::<temps_config::ConfigService>();
+            let instance_id = config_service
+                .stateless_instance_id()
+                .await
+                .map_err(|error| PluginError::PluginRegistrationFailed {
+                    plugin_name: "logs".to_string(),
+                    error: format!("Failed to read persisted installation mode: {error}"),
+                })?;
+            let durable_chunks = matches!(
+                temps_file_store::s3_config::resolve_stateless_storage_for(instance_id.as_deref())
+                    .map_err(|error| {
+                        PluginError::PluginRegistrationFailed {
+                            plugin_name: "logs".to_string(),
+                            error: format!("Failed to resolve stateless log storage: {error}"),
+                        }
+                    })?,
+                StatelessStorage::Enabled { .. }
+            );
+            let log_service = Arc::new(LogService::with_archive_mode(
                 self.log_base_path.clone(),
                 archive,
+                durable_chunks,
             ));
             context.register_service(log_service);
             // DockerLogService is registered unconditionally — it holds an

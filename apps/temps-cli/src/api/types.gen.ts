@@ -671,6 +671,24 @@ export type AgentSandboxSettingsMasked = {
     sandbox_backend: string;
 };
 
+export type AggregateResponse = {
+    rows: Array<AggregateRow>;
+};
+
+/**
+ * One row of an aggregation: the group values (in `group_by` order) and
+ * the metric.
+ */
+export type AggregateRow = {
+    keys: Array<string>;
+    /**
+     * Lines that contributed (always populated; equals `value` for
+     * `Count`).
+     */
+    lines: number;
+    value: number;
+};
+
 export type AggregatedBucketItem = {
     count: number;
     timestamp: string;
@@ -1129,6 +1147,50 @@ export type AllocEntry = {
      */
     node_id: string;
     underlay_address: string;
+};
+
+export type AnalyticsCapability = {
+    backend?: null | LineIndexBackend;
+    /**
+     * `true` when the line index is active and receiving sealed chunks.
+     */
+    configured: boolean;
+    /**
+     * What analytics would do here — shown as the example in the
+     * onboarding state.
+     */
+    example: string;
+    /**
+     * Chunks retired (compacted, purged, or expired by retention) whose
+     * removal from the line index has not yet been confirmed — durably
+     * queued in `log_line_forget_backlog` and drained by `ForgetSweeper`
+     * (ADR-047 §8a). Non-zero for more than a few sweep intervals (30s,
+     * see [`crate::services::FORGET_SWEEP_INTERVAL`]) means the index
+     * still holds rows for chunks that no longer exist — over-counted in
+     * facets/histograms/aggregates until the sweeper catches up.
+     */
+    forget_backlog: number;
+    indexed_chunks: number;
+    /**
+     * Live chunks in the manifest and how many of them are indexed. Equal
+     * numbers mean the index is complete; a gap is the reindexer's queue.
+     */
+    live_chunks: number;
+    /**
+     * Widest window one analytics query answers on this store, in days.
+     * The TimescaleDB store clamps `start_time` to this many days before
+     * `end_time` so a query can never scan the whole control-plane
+     * database; ClickHouse stores are unbounded (`None`).
+     */
+    max_window_days?: number | null;
+    /**
+     * Exactly what is missing, when `configured` is false.
+     */
+    reason?: string | null;
+    /**
+     * Console route where the operator fixes it.
+     */
+    setup_path: string;
 };
 
 export type AnalyticsFacet = 'summary' | 'traffic' | 'pages' | 'events' | 'breakdown' | 'speed';
@@ -2081,6 +2143,28 @@ export type AttachScheduleServicesResponse = {
      * Total number of services now attached to the schedule.
      */
     total_attached: number;
+};
+
+export type AttrOp = 'eq' | 'neq' | 'exists' | 'prefix' | 'gt' | 'lt';
+
+/**
+ * Predicate on one attribute (canonical or dynamic).
+ */
+export type AttrPredicate = {
+    /**
+     * Attribute key: a canonical key (`status_code`, `http_route`, …) or
+     * any extracted key (`worker`, `http.status`).
+     */
+    key: string;
+    op?: AttrOp;
+    /**
+     * Omitted for `exists`.
+     */
+    value?: string | null;
+};
+
+export type AttributeKeysResponse = {
+    keys: Array<FacetValue>;
 };
 
 /**
@@ -4249,6 +4333,20 @@ export type ContainerListResponse = {
  */
 export type ContainerLogSettings = {
     /**
+     * Disk budget, in MiB, for the collected-log read cache (`logs/cache`
+     * under the data dir): recently read chunk blocks, block indexes and
+     * bloom filters kept locally so searches over object storage do not
+     * re-fetch them (ADR-046 §6). Applied within a minute of saving;
+     * shrinking evicts immediately.
+     */
+    cache_mb?: number;
+    /**
+     * Per-container cap, in MiB, on unsealed log lines held in memory (and
+     * the WAL) before they are sealed into a chunk object. Larger buffers
+     * mean fewer, bigger chunks; smaller ones bound memory per container.
+     */
+    head_buffer_mb?: number;
+    /**
      * Maximum number of rotated log files to keep (e.g., 3 means up to 3 x max_size total)
      */
     max_file?: number;
@@ -4506,18 +4604,25 @@ export type ContextLine = {
      */
     is_match: boolean;
     level: LogLevel;
-    line_offset: number;
+    /**
+     * Decimal string form of this line's `line_id` — see [`LogSearchLine`].
+     */
+    line_id: string;
     message: string;
     timestamp: string;
 };
 
 export type ContextLogsRequest = {
-    chunk_id: string;
-    line_offset: number;
+    container_id: string;
     /**
-     * Number of context lines before and after (default: 25)
+     * Decimal string form of the target line's `line_id`.
+     */
+    line_id: string;
+    /**
+     * Number of context lines before and after (default: 25, max 50)
      */
     lines?: number | null;
+    timestamp: string;
 };
 
 export type ContextLogsResponse = {
@@ -7615,6 +7720,36 @@ export type DockerRegistrySettingsMasked = {
 };
 
 /**
+ * Where a project is granted host Docker access, published on the project
+ * response so the console can render a badge (granted) or an onboarding state
+ * (not granted) instead of the feature being invisible.
+ *
+ * Deliberately read-only. The grant is host policy; there is no write path,
+ * and an API that could set it would be one step from host root.
+ */
+export type DockerSocketCapability = {
+    /**
+     * Whether any host grants this project `/var/run/docker.sock`.
+     */
+    granted: boolean;
+    /**
+     * Hosts that grant it: worker node names, plus `control-plane` when this
+     * control plane's own environment names the project. Empty when not
+     * granted.
+     */
+    nodes: Array<string>;
+    /**
+     * Why it is not granted, when `granted` is false. Names the exact
+     * variable, value and processes, because the operator is debugging alone.
+     */
+    reason?: string | null;
+    /**
+     * Console path that shows the hosts this could be set on.
+     */
+    setup_path?: string | null;
+};
+
+/**
  * Configuration for Dockerfile preset
  * Allows customizing the Dockerfile path and build context for Docker-based deployments
  */
@@ -8164,6 +8299,11 @@ export type EnqueuedJob = {
 };
 
 export type EnrichVisitorRequest = {
+    /**
+     * Attributes to attach to the visitor. Top-level keys are merged into the
+     * visitor's stored `custom_data`; a key whose value is `null` removes that
+     * key. Deployment tokens may send at most 32 keys and 8 KB.
+     */
     custom_data: {
         [key: string]: unknown;
     };
@@ -9516,6 +9656,14 @@ export type FacetCapability = {
 };
 
 /**
+ * A dimension a caller can ask for distinct values of.
+ *
+ * Restricted to a closed enum on purpose: the field name reaches SQL as a
+ * column identifier, so it can never be caller-supplied text.
+ */
+export type FacetField = 'env' | 'service' | 'level' | 'stream' | 'project' | 'external_service' | 'node' | 'deploy' | 'container';
+
+/**
  * Public representation of a registered span attribute facet.
  */
 export type FacetInfo = {
@@ -9547,6 +9695,21 @@ export type FacetInfo = {
  * the poller advances a facet through these states.
  */
 export type FacetStatus = 'pending' | 'running' | 'completed' | 'failed' | 'deleting';
+
+/**
+ * One distinct value of a facet field, with its occurrence count inside the
+ * queried window.
+ */
+export type FacetValue = {
+    count: number;
+    value: string;
+};
+
+export type FacetsAttrsResponse = {
+    facets: {
+        [key: string]: unknown;
+    };
+};
 
 /**
  * Response body for facet list.
@@ -10772,14 +10935,84 @@ export type GlobalEventStatsResponse = {
     opened: number;
 };
 
+/**
+ * What the log explorer can offer on this instance. Attribute facets,
+ * histograms and `GROUP BY` analytics need the ClickHouse line index; when
+ * it is missing the client shows *why* and where to configure it instead
+ * of hiding the feature (CLAUDE.md: unconfigured features onboard).
+ */
+export type GlobalLogCapabilities = {
+    analytics: AnalyticsCapability;
+};
+
+/**
+ * Facet request: the same filter body plus the fields to aggregate.
+ */
+export type GlobalLogFacetsRequest = GlobalLogSearchRequest & {
+    /**
+     * Fields to return distinct values for. Empty returns the default set.
+     */
+    fields?: Array<FacetField>;
+};
+
+/**
+ * Distinct values and counts per requested field, inside the current window.
+ */
+export type GlobalLogFacetsResponse = {
+    /**
+     * Keyed by field name (`env`, `service`, `level`, `node_id`, …). Values
+     * are ordered by count, descending.
+     */
+    facets: {
+        [key: string]: unknown;
+    };
+    /**
+     * `true` when a field's value list was capped or timed out, so it is a
+     * prefix rather than the complete set. Reported rather than glossed: the
+     * point of a facet is that a user can trust it to surface values they
+     * have never seen on screen.
+     */
+    partial: boolean;
+};
+
+/**
+ * One line in a global search result.
+ */
 export type GlobalLogLine = LogSearchLine & {
     env: string;
     external_service_id?: number | null;
+    /**
+     * Display name of the owning project or external service.
+     */
     owner: string;
+    /**
+     * `None` for external-service lines.
+     */
     project_id?: number | null;
 };
 
+/**
+ * Filter body shared by `/logs/global/search` and `/logs/global/facets`.
+ *
+ * Both endpoints take the identical filter set so a facet count always
+ * describes the search the user is actually looking at.
+ */
 export type GlobalLogSearchRequest = {
+    /**
+     * Attribute predicates (ADR-047 §5): `<key><op><value>` with `op` one of
+     * `=`, `!=`, `^=` (prefix), `>`, `<`, or `<key>?` for "exists". Requires
+     * the line index; when combined with `text`, the text filter is applied
+     * in memory over the lines the index already matched (the index holds
+     * no message bytes, so it cannot answer `text` on its own).
+     */
+    attrs?: Array<string>;
+    /**
+     * Docker container IDs.
+     */
+    container_ids?: Array<string>;
+    /**
+     * Opaque cursor from the previous page's `next_cursor`.
+     */
     cursor?: string | null;
     deploy_id?: number | null;
     end_time: string;
@@ -10790,37 +11023,57 @@ export type GlobalLogSearchRequest = {
     external_services?: Array<string>;
     levels?: Array<LogLevel>;
     node_ids?: Array<number>;
+    /**
+     * Defaults to 200, server-capped at 1000.
+     */
     page_size?: number | null;
     /**
      * Match project ID, slug or name. Empty selects all authorized projects.
      */
     projects?: Array<string>;
     /**
-     * Explicit resource identities, e.g. application:12 or service:34.
+     * Explicit resource identities, e.g. `application:12` or `service:34`.
      */
     scopes?: Array<string>;
-    source?: GlobalLogSource;
+    /**
+     * Container service labels (the `service` column), e.g. `web`, `worker`.
+     */
+    services?: Array<string>;
+    source?: LogSourceKind;
     start_time: string;
+    /**
+     * Case-insensitive substring match over the message.
+     */
     text?: string | null;
 };
 
+/**
+ * A page of global search results.
+ */
 export type GlobalLogSearchResponse = {
     /**
-     * Newest first, ordered by timestamp, chunk ID and line offset.
+     * Newest first, ordered by `(timestamp, container_id, line_id)`.
      */
     lines: Array<GlobalLogLine>;
+    /**
+     * Opaque cursor for the next (older) page, or `None` on the last page.
+     *
+     * This is a keyset position over the store's own sort order, so page 40
+     * costs what page 1 costs. Stays populated on a partial page too — that
+     * is the whole point: the user can press Next to keep searching.
+     */
     next_cursor?: string | null;
     /**
-     * True means the scan budget was exhausted. Lines contain the newest
-     * matches found in this scan window, but unread chunks may contain newer
-     * lines. `next_cursor` continues into another bounded scan window.
+     * `true` when the store's time/byte budget ran out before this page
+     * could be proven complete (`scanned_back_to` explains how far).
      */
-    scan_limit_reached: boolean;
-    scanned_bytes: number;
-    scanned_chunks: number;
+    partial: boolean;
+    /**
+     * Set when `partial` is `true`: every chunk ending after this timestamp
+     * has been searched, nothing older has yet.
+     */
+    scanned_back_to?: string | null;
 };
-
-export type GlobalLogSource = 'collected' | 'application' | 'service';
 
 export type GlobalMrrResponse = {
     /**
@@ -10896,6 +11149,23 @@ export type GlobalTracesResponse = {
      * Effective per-project windows; totals and rows describe these windows.
      */
     windows: Array<GlobalTraceWindow>;
+};
+
+/**
+ * What to group or facet by.
+ */
+export type GroupKey = {
+    kind: 'label';
+    /**
+     * A stream label (`service`, `env`, `level`, …).
+     */
+    name: FacetField;
+} | {
+    kind: 'attr';
+    /**
+     * An attribute key.
+     */
+    name: string;
 };
 
 export type GroupedPageMetric = {
@@ -11091,9 +11361,21 @@ export type HeartbeatApiRequest = {
     containers?: Array<ContainerInventoryItem> | null;
     dns_resolver?: null | DnsResolverHeartbeat;
     /**
+     * Project slugs this node grants host Docker access to (ADR 045), read
+     * by the agent from its own `TEMPS_DOCKER_SOCKET_PROJECTS`.
+     *
+     * Advisory only: it tells the scheduler where a granted project *may* be
+     * placed. It can never cause a socket to be mounted — that decision is
+     * made by the executing process against its own environment. `None` from
+     * a pre-ADR-045 agent leaves the stored value untouched; an empty array
+     * clears it.
+     */
+    docker_socket_projects?: Array<string> | null;
+    /**
      * Updated node labels for scheduling (allows runtime label changes).
      */
     labels?: unknown;
+    public_ingress?: null | PublicIngressHeartbeat;
 };
 
 export type HeartbeatResponse = {
@@ -11125,6 +11407,19 @@ export type HierarchyLevel = {
      * Human-readable name for this level
      */
     name: string;
+};
+
+/**
+ * One time bucket of a histogram, optionally split by a group value.
+ */
+export type HistogramBucket = {
+    count: number;
+    group?: string | null;
+    ts: string;
+};
+
+export type HistogramResponse = {
+    buckets: Array<HistogramBucket>;
 };
 
 /**
@@ -12210,6 +12505,13 @@ export type LineContext = {
     before: Array<ContextLine>;
 };
 
+/**
+ * The stores a line index can live in, in the order the plugin prefers
+ * them: the instance's own ClickHouse, then Temps Cloud's, then the
+ * control-plane TimescaleDB.
+ */
+export type LineIndexBackend = 'clickhouse' | 'temps_cloud' | 'timescaledb';
+
 export type LinkApplicationProjectRequest = {
     project_id: number;
 };
@@ -12609,20 +12911,29 @@ export type LogRecord = {
 };
 
 /**
- * A single line in search results
+ * A single line in search results.
+ *
+ * Identity is `(timestamp, container_id, line_id)` — the store's own sort
+ * order, which is also the pagination key. `line_id` is serialized as a
+ * **string**: it is seeded from a 64-bit chunk/line encoding well past the
+ * 2^53 an IEEE-754 double can represent exactly, so a JSON number would
+ * silently lose its low digits in every JavaScript client.
  */
 export type LogSearchLine = {
-    chunk_id: string;
     /**
      * Container this line came from — lets the UI tag/group lines by container
-     * in a combined ("show all") multi-container view.
+     * in a combined ("show all") multi-container view, and is the second
+     * component of the line's identity.
      */
     container_id?: string;
     context?: null | LineContext;
     deploy_id?: number | null;
     fields?: unknown;
     level: LogLevel;
-    line_offset: number;
+    /**
+     * Decimal string form of the line's `line_id`. See the type docs.
+     */
+    line_id: string;
     message: string;
     /**
      * Worker node the line came from (`None` = control-plane-local).
@@ -12633,6 +12944,10 @@ export type LogSearchLine = {
      */
     node_name?: string | null;
     service: string;
+    /**
+     * stdout or stderr.
+     */
+    stream: LogStream;
     timestamp: string;
 };
 
@@ -12653,6 +12968,11 @@ export type LogSource = {
     node_name?: string | null;
     service: string;
 };
+
+/**
+ * Which family of log sources a query covers.
+ */
+export type LogSourceKind = 'collected' | 'application' | 'service';
 
 /**
  * Log output stream
@@ -12889,6 +13209,34 @@ export type MessageResponse = {
  * * `Ignore`: drop metered subscriptions from MRR entirely.
  */
 export type MeteredMode = 'derive_from_invoices' | 'use_subscription' | 'ignore';
+
+/**
+ * Aggregate metric for [`LogAnalytics::aggregate`].
+ */
+export type Metric = {
+    fn: 'count';
+} | {
+    attr: string;
+    fn: 'count_distinct';
+} | {
+    attr: string;
+    fn: 'avg';
+} | {
+    attr: string;
+    fn: 'p50';
+} | {
+    attr: string;
+    fn: 'p95';
+} | {
+    attr: string;
+    fn: 'p99';
+} | {
+    attr: string;
+    fn: 'max';
+} | {
+    attr: string;
+    fn: 'sum';
+};
 
 /**
  * The aggregation applied when reducing raw metric points into a time bucket.
@@ -13767,6 +14115,13 @@ export type NodeInfoResponse = {
     last_heartbeat?: string | null;
     name: string;
     private_address: string;
+    public_ingress_certificate_count?: number | null;
+    public_ingress_enabled: boolean;
+    public_ingress_last_error?: string | null;
+    public_ingress_route_count?: number | null;
+    public_ingress_running?: boolean | null;
+    public_ingress_unsupported_reasons: Array<string>;
+    public_ingress_unsupported_route_count?: number | null;
     role: string;
     status: string;
 };
@@ -13884,6 +14239,12 @@ export type ObservabilityEvent = (RequestRow & {
  * logs and spans retain their storage-level per-row TTL behavior.
  */
 export type ObservabilityRetentionSettings = {
+    /**
+     * Retain collected container logs (chunk objects on disk/S3, their
+     * manifest rows, and the ClickHouse line index when configured) for
+     * this many days.
+     */
+    container_logs_days?: number;
     /**
      * Retain OpenTelemetry log events for this many days.
      */
@@ -15392,6 +15753,10 @@ export type PlatformFeatures = {
      */
     docker: boolean;
     /**
+     * External plugin binaries and plugin-owned files may be installed.
+     */
+    external_plugins?: boolean;
+    /**
      * Container images can be built by this process. Requires a local Docker
      * daemon; always `false` when `docker` is `false`.
      */
@@ -15416,6 +15781,10 @@ export type PlatformFeatures = {
      */
     managed_services: boolean;
     /**
+     * AI editing workspaces and chat attachments have durable local storage.
+     */
+    persistent_workspaces?: boolean;
+    /**
      * Serve profile this process was started with: `"full"` or
      * `"control-plane"`.
      */
@@ -15425,6 +15794,11 @@ export type PlatformFeatures = {
      * local Docker daemon.
      */
     sandboxes: boolean;
+    /**
+     * This installation uses Postgres, injected secrets and S3 for durable
+     * state; its control-plane scratch disk may be discarded.
+     */
+    stateless?: boolean;
     /**
      * Container image vulnerability scanning is available. Requires a local
      * Docker daemon to pull and scan images.
@@ -16065,6 +16439,7 @@ export type ProjectResponse = {
      */
     deployment_config: DeploymentConfig;
     directory: string;
+    docker_socket?: null | DockerSocketCapability;
     /**
      * Enable automatic preview environment creation for each branch
      */
@@ -16942,6 +17317,15 @@ export type PublicEnvExampleResponse = {
  * required by its Universal SSL wildcard cert without changing every domain's behaviour.
  */
 export type PublicHostnameStrategy = 'standard' | 'flat';
+
+export type PublicIngressHeartbeat = {
+    certificate_count: number;
+    last_error?: string | null;
+    route_count: number;
+    running: boolean;
+    unsupported_reasons?: Array<string>;
+    unsupported_route_count: number;
+};
 
 /**
  * Information about a public IP address lookup
@@ -18932,15 +19316,23 @@ export type SearchLogsResponse = {
      */
     available_sources?: Array<LogSource>;
     lines: Array<LogSearchLine>;
+    /**
+     * Opaque keyset cursor for the next (older) page. Stays populated on a
+     * partial page — that's the whole point: the user can press Next to keep
+     * searching.
+     */
     next_cursor?: string | null;
-    search_mode: SearchMode;
-    total_scanned: number;
+    /**
+     * `true` when the store's time/byte budget ran out before this page
+     * could be proven complete.
+     */
+    partial?: boolean;
+    /**
+     * Set when `partial` is `true`: every chunk ending after this timestamp
+     * has been searched, nothing older has yet.
+     */
+    scanned_back_to?: string | null;
 };
-
-/**
- * Search execution mode
- */
-export type SearchMode = 'index' | 'archive';
 
 /**
  * Seasonality model for an anomaly baseline.
@@ -20039,6 +20431,15 @@ export type SetFlagEnvironmentRequest = {
 
 export type SetHttpCheckEnabled = {
     enabled: boolean;
+};
+
+export type SetNodePublicIngressRequest = {
+    enabled: boolean;
+};
+
+export type SetNodePublicIngressResponse = {
+    enabled: boolean;
+    node_id: number;
 };
 
 export type SetPreviewPasswordBody = {
@@ -26003,6 +26404,7 @@ export type DeployApplicationWorkspaceProjectErrors = {
     401: unknown;
     403: unknown;
     404: unknown;
+    409: unknown;
     413: unknown;
     503: unknown;
 };
@@ -29176,28 +29578,27 @@ export type EnrichVisitorData = {
     body: EnrichVisitorRequest;
     path: {
         /**
-         * Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx)
+         * Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx). Deployment tokens (visitors:enrich) may only use the encrypted GUID and only for visitors of their own project.
          */
         visitor_id: string;
     };
-    query: {
-        /**
-         * Project ID or slug
-         */
-        project_id: number;
-    };
+    query?: never;
     url: '/analytics/visitors/{visitor_id}/enrich';
 };
 
 export type EnrichVisitorErrors = {
     /**
-     * Invalid parameters or project not found
+     * Invalid visitor ID, or enrichment data that is not a JSON object within the size limits
      */
     400: unknown;
     /**
-     * Visitor not found
+     * Deployment token used with a non-encrypted visitor ID
      */
-    404: unknown;
+    403: unknown;
+    /**
+     * The deployment token made too many visitor-changing enrichments in the last minute; retry shortly
+     */
+    429: unknown;
     /**
      * Internal server error
      */
@@ -29206,7 +29607,7 @@ export type EnrichVisitorErrors = {
 
 export type EnrichVisitorResponses = {
     /**
-     * Successfully enriched visitor data
+     * Enrichment result. `success: false` means the visitor was not found (or is not in the caller's project) and nothing was changed.
      */
     200: EnrichVisitorResponse;
 };
@@ -40382,6 +40783,10 @@ export type NodeHeartbeatData = {
 
 export type NodeHeartbeatErrors = {
     /**
+     * Invalid heartbeat payload
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
@@ -40439,6 +40844,32 @@ export type ListPeersResponses = {
 };
 
 export type ListPeersResponse = ListPeersResponses[keyof ListPeersResponses];
+
+export type AdminSetNodePublicIngressData = {
+    body: SetNodePublicIngressRequest;
+    path: {
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/public-ingress';
+};
+
+export type AdminSetNodePublicIngressErrors = {
+    /**
+     * Node is not a worker
+     */
+    400: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+};
+
+export type AdminSetNodePublicIngressResponses = {
+    200: SetNodePublicIngressResponse;
+};
+
+export type AdminSetNodePublicIngressResponse = AdminSetNodePublicIngressResponses[keyof AdminSetNodePublicIngressResponses];
 
 export type GetS3CredentialsData = {
     body?: never;
@@ -41181,15 +41612,19 @@ export type GetLogContextData = {
     path?: never;
     query: {
         /**
-         * Chunk ID
+         * Target line timestamp (RFC 3339)
          */
-        chunk_id: string;
+        timestamp: string;
         /**
-         * Line offset within the chunk
+         * Target line container ID
          */
-        line_offset: number;
+        container_id: string;
         /**
-         * Context lines before and after (default: 25)
+         * Target line_id, as a decimal string
+         */
+        line_id: string;
+        /**
+         * Context lines before and after (default: 25, max 50)
          */
         lines?: number;
     };
@@ -41206,7 +41641,7 @@ export type GetLogContextErrors = {
      */
     401: ProblemDetails;
     /**
-     * Chunk not found
+     * Line not found
      */
     404: ProblemDetails;
     /**
@@ -41226,6 +41661,374 @@ export type GetLogContextResponses = {
 
 export type GetLogContextResponse = GetLogContextResponses[keyof GetLogContextResponses];
 
+export type GlobalLogAggregateData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Window start (RFC 3339)
+         */
+        start_time: string;
+        /**
+         * Window end (RFC 3339)
+         */
+        end_time: string;
+        /**
+         * Source kind (default: all)
+         */
+        source?: LogSourceKind;
+        /**
+         * Project selectors (repeatable)
+         */
+        projects?: Array<string>;
+        /**
+         * External service selectors (repeatable)
+         */
+        external_services?: Array<string>;
+        /**
+         * Scope selectors (repeatable)
+         */
+        scopes?: Array<string>;
+        /**
+         * Levels (repeatable)
+         */
+        levels?: Array<LogLevel>;
+        /**
+         * Environments (repeatable)
+         */
+        envs?: Array<string>;
+        /**
+         * Services (repeatable)
+         */
+        services?: Array<string>;
+        /**
+         * Container ids (repeatable)
+         */
+        container_ids?: Array<string>;
+        /**
+         * Node ids (repeatable)
+         */
+        node_ids?: Array<number>;
+        /**
+         * Deployment id
+         */
+        deploy_id?: number;
+        /**
+         * Comma-separated label names and/or attr:<name>
+         */
+        group_by: string;
+        /**
+         * count | count_distinct:<k> | avg:<k> | p50:<k> | p95:<k> | p99:<k> | max:<k> | sum:<k>
+         */
+        metric: string;
+        /**
+         * Max rows returned (default 50, cap 1000)
+         */
+        limit?: number;
+        /**
+         * Repeatable attribute predicate: <key><op><value> or <key>?
+         */
+        attr: Array<string>;
+    };
+    url: '/logs/global/aggregate';
+};
+
+export type GlobalLogAggregateErrors = {
+    400: ProblemDetails;
+    403: ProblemDetails;
+    503: ProblemDetails;
+};
+
+export type GlobalLogAggregateError = GlobalLogAggregateErrors[keyof GlobalLogAggregateErrors];
+
+export type GlobalLogAggregateResponses = {
+    200: AggregateResponse;
+};
+
+export type GlobalLogAggregateResponse = GlobalLogAggregateResponses[keyof GlobalLogAggregateResponses];
+
+export type GlobalLogAttributeKeysData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Window start (RFC 3339)
+         */
+        start_time: string;
+        /**
+         * Window end (RFC 3339)
+         */
+        end_time: string;
+        /**
+         * Source kind (default: all)
+         */
+        source?: LogSourceKind;
+        /**
+         * Project selectors (repeatable)
+         */
+        projects?: Array<string>;
+        /**
+         * External service selectors (repeatable)
+         */
+        external_services?: Array<string>;
+        /**
+         * Scope selectors (repeatable)
+         */
+        scopes?: Array<string>;
+        /**
+         * Levels (repeatable)
+         */
+        levels?: Array<LogLevel>;
+        /**
+         * Environments (repeatable)
+         */
+        envs?: Array<string>;
+        /**
+         * Services (repeatable)
+         */
+        services?: Array<string>;
+        /**
+         * Container ids (repeatable)
+         */
+        container_ids?: Array<string>;
+        /**
+         * Node ids (repeatable)
+         */
+        node_ids?: Array<number>;
+        /**
+         * Deployment id
+         */
+        deploy_id?: number;
+        /**
+         * Max keys returned (default/cap 1000)
+         */
+        limit?: number;
+    };
+    url: '/logs/global/attributes';
+};
+
+export type GlobalLogAttributeKeysErrors = {
+    400: ProblemDetails;
+    403: ProblemDetails;
+    503: ProblemDetails;
+};
+
+export type GlobalLogAttributeKeysError = GlobalLogAttributeKeysErrors[keyof GlobalLogAttributeKeysErrors];
+
+export type GlobalLogAttributeKeysResponses = {
+    200: AttributeKeysResponse;
+};
+
+export type GlobalLogAttributeKeysResponse = GlobalLogAttributeKeysResponses[keyof GlobalLogAttributeKeysResponses];
+
+export type GlobalLogCapabilitiesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/logs/global/capabilities';
+};
+
+export type GlobalLogCapabilitiesErrors = {
+    403: ProblemDetails;
+};
+
+export type GlobalLogCapabilitiesError = GlobalLogCapabilitiesErrors[keyof GlobalLogCapabilitiesErrors];
+
+export type GlobalLogCapabilitiesResponses = {
+    200: GlobalLogCapabilities;
+};
+
+export type GlobalLogCapabilitiesResponse = GlobalLogCapabilitiesResponses[keyof GlobalLogCapabilitiesResponses];
+
+export type FacetGlobalLogsData = {
+    body: GlobalLogFacetsRequest;
+    path?: never;
+    query?: never;
+    url: '/logs/global/facets';
+};
+
+export type FacetGlobalLogsErrors = {
+    400: ProblemDetails;
+    403: ProblemDetails;
+    408: ProblemDetails;
+};
+
+export type FacetGlobalLogsError = FacetGlobalLogsErrors[keyof FacetGlobalLogsErrors];
+
+export type FacetGlobalLogsResponses = {
+    200: GlobalLogFacetsResponse;
+};
+
+export type FacetGlobalLogsResponse = FacetGlobalLogsResponses[keyof FacetGlobalLogsResponses];
+
+export type GlobalLogFacetsAttrsData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Window start (RFC 3339)
+         */
+        start_time: string;
+        /**
+         * Window end (RFC 3339)
+         */
+        end_time: string;
+        /**
+         * Source kind (default: all)
+         */
+        source?: LogSourceKind;
+        /**
+         * Project selectors (repeatable)
+         */
+        projects?: Array<string>;
+        /**
+         * External service selectors (repeatable)
+         */
+        external_services?: Array<string>;
+        /**
+         * Scope selectors (repeatable)
+         */
+        scopes?: Array<string>;
+        /**
+         * Levels (repeatable)
+         */
+        levels?: Array<LogLevel>;
+        /**
+         * Environments (repeatable)
+         */
+        envs?: Array<string>;
+        /**
+         * Services (repeatable)
+         */
+        services?: Array<string>;
+        /**
+         * Container ids (repeatable)
+         */
+        container_ids?: Array<string>;
+        /**
+         * Node ids (repeatable)
+         */
+        node_ids?: Array<number>;
+        /**
+         * Deployment id
+         */
+        deploy_id?: number;
+        /**
+         * Comma-separated label names or attr:<name>
+         */
+        keys: string;
+        /**
+         * Repeatable attribute predicate: <key><op><value> or <key>?
+         */
+        attr: Array<string>;
+        /**
+         * Max values per key (default/cap 1000)
+         */
+        limit?: number;
+    };
+    url: '/logs/global/facets/attrs';
+};
+
+export type GlobalLogFacetsAttrsErrors = {
+    400: ProblemDetails;
+    403: ProblemDetails;
+    503: ProblemDetails;
+};
+
+export type GlobalLogFacetsAttrsError = GlobalLogFacetsAttrsErrors[keyof GlobalLogFacetsAttrsErrors];
+
+export type GlobalLogFacetsAttrsResponses = {
+    200: FacetsAttrsResponse;
+};
+
+export type GlobalLogFacetsAttrsResponse = GlobalLogFacetsAttrsResponses[keyof GlobalLogFacetsAttrsResponses];
+
+export type GlobalLogHistogramData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Window start (RFC 3339)
+         */
+        start_time: string;
+        /**
+         * Window end (RFC 3339)
+         */
+        end_time: string;
+        /**
+         * Source kind (default: all)
+         */
+        source?: LogSourceKind;
+        /**
+         * Project selectors (repeatable)
+         */
+        projects?: Array<string>;
+        /**
+         * External service selectors (repeatable)
+         */
+        external_services?: Array<string>;
+        /**
+         * Scope selectors (repeatable)
+         */
+        scopes?: Array<string>;
+        /**
+         * Levels (repeatable)
+         */
+        levels?: Array<LogLevel>;
+        /**
+         * Environments (repeatable)
+         */
+        envs?: Array<string>;
+        /**
+         * Services (repeatable)
+         */
+        services?: Array<string>;
+        /**
+         * Container ids (repeatable)
+         */
+        container_ids?: Array<string>;
+        /**
+         * Node ids (repeatable)
+         */
+        node_ids?: Array<number>;
+        /**
+         * Deployment id
+         */
+        deploy_id?: number;
+        /**
+         * Bucket width in seconds (default 60)
+         */
+        bucket_secs?: number;
+        /**
+         * One label name or attr:<name> to split series by
+         */
+        group_by?: string;
+        /**
+         * Max series before folding the rest into "other" (default 8)
+         */
+        max_groups?: number;
+        /**
+         * Repeatable attribute predicate: <key><op><value> or <key>?
+         */
+        attr: Array<string>;
+    };
+    url: '/logs/global/histogram';
+};
+
+export type GlobalLogHistogramErrors = {
+    400: ProblemDetails;
+    403: ProblemDetails;
+    503: ProblemDetails;
+};
+
+export type GlobalLogHistogramError = GlobalLogHistogramErrors[keyof GlobalLogHistogramErrors];
+
+export type GlobalLogHistogramResponses = {
+    200: HistogramResponse;
+};
+
+export type GlobalLogHistogramResponse = GlobalLogHistogramResponses[keyof GlobalLogHistogramResponses];
+
 export type SearchGlobalLogsData = {
     body: GlobalLogSearchRequest;
     path?: never;
@@ -41236,7 +42039,7 @@ export type SearchGlobalLogsData = {
 export type SearchGlobalLogsErrors = {
     400: ProblemDetails;
     403: ProblemDetails;
-    429: ProblemDetails;
+    408: ProblemDetails;
 };
 
 export type SearchGlobalLogsError = SearchGlobalLogsErrors[keyof SearchGlobalLogsErrors];
@@ -45933,9 +46736,17 @@ export type CreateProjectErrors = {
      */
     400: unknown;
     /**
+     * Insufficient permissions, or the slug is reserved for host Docker access and only an instance admin may claim it (ADR 045)
+     */
+    403: unknown;
+    /**
      * Expected project slug is already in use
      */
     409: unknown;
+    /**
+     * The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)
+     */
+    428: unknown;
     /**
      * Internal server error
      */
@@ -46032,13 +46843,17 @@ export type CreateProjectFromTemplateErrors = {
      */
     401: unknown;
     /**
-     * Insufficient permissions
+     * Insufficient permissions, or the slug is reserved for host Docker access and only an instance admin may claim it (ADR 045)
      */
     403: unknown;
     /**
      * Template not found
      */
     404: unknown;
+    /**
+     * The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)
+     */
+    428: unknown;
     /**
      * Internal server error
      */
@@ -49864,6 +50679,10 @@ export type SendFailureReportErrors = {
      */
     404: unknown;
     /**
+     * Report text is empty
+     */
+    422: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -52097,6 +52916,10 @@ export type DeployFromImageUploadErrors = {
      */
     404: unknown;
     /**
+     * Deployment method unavailable in stateless mode
+     */
+    409: unknown;
+    /**
      * Image tarball too large
      */
     413: unknown;
@@ -52182,6 +53005,10 @@ export type DeployFromUploadedSourceErrors = {
      * Project or environment not found
      */
     404: unknown;
+    /**
+     * Deployment method unavailable in stateless mode
+     */
+    409: unknown;
 };
 
 export type DeployFromUploadedSourceResponses = {
@@ -52220,6 +53047,10 @@ export type DeployFromStaticErrors = {
      * Project, environment, or bundle not found
      */
     404: unknown;
+    /**
+     * Deployment method unavailable in stateless mode
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -55911,13 +56742,17 @@ export type UpdateProjectSettingsErrors = {
      */
     401: unknown;
     /**
-     * Forbidden
+     * Forbidden, or the slug being claimed or given up is reserved for host Docker access and only an instance admin may move it (ADR 045)
      */
     403: unknown;
     /**
      * Project not found
      */
     404: unknown;
+    /**
+     * The reserved slug requires a recently MFA-verified session; complete step-up verification and retry (ADR 045)
+     */
+    428: unknown;
     /**
      * Internal server error
      */
@@ -56463,6 +57298,10 @@ export type UploadStaticBundleErrors = {
      * Project not found
      */
     404: unknown;
+    /**
+     * Deployment method unavailable in stateless mode
+     */
+    409: unknown;
     /**
      * Bundle too large
      */

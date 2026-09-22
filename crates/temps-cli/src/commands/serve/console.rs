@@ -1844,6 +1844,9 @@ fn docker_unavailable_error(reason: &str) -> anyhow::Error {
 /// Storage backend selection for the log aggregator.
 #[derive(Debug, thiserror::Error)]
 pub enum LogStorageConfigError {
+    #[error(transparent)]
+    Stateless(#[from] temps_file_store::s3_config::StaticStorageConfigError),
+
     #[error(
         "TEMPS_LOG_STORAGE_BACKEND is set to 's3', but {variable} is not set. Set it (and the \
          other TEMPS_LOG_S3_* variables), or unset TEMPS_LOG_STORAGE_BACKEND to store aggregated \
@@ -1860,12 +1863,31 @@ pub enum LogStorageConfigError {
 /// have failed as well. Returns a typed error the caller renders instead.
 fn log_aggregator_storage_config(
     data_dir: &std::path::Path,
+    stateless_instance_id: Option<&str>,
 ) -> Result<StorageConfig, LogStorageConfigError> {
     fn required(variable: &'static str) -> Result<String, LogStorageConfigError> {
         std::env::var(variable)
             .ok()
             .filter(|value| !value.trim().is_empty())
             .ok_or(LogStorageConfigError::MissingS3Variable { variable })
+    }
+
+    let stateless =
+        temps_file_store::s3_config::resolve_stateless_storage_for(stateless_instance_id)?;
+    if let Some(prefix) = stateless.subsystem_prefix("logs") {
+        if let temps_file_store::s3_config::StaticStorageBackend::S3(storage) =
+            temps_file_store::s3_config::resolve_static_storage_backend_for(&stateless)?
+        {
+            return Ok(StorageConfig::S3 {
+                bucket: storage.bucket,
+                region: storage.region,
+                endpoint: storage.endpoint,
+                access_key_id: storage.access_key_id,
+                secret_access_key: storage.secret_access_key,
+                prefix: Some(prefix),
+                force_path_style: storage.force_path_style,
+            });
+        }
     }
 
     let backend =
@@ -3103,8 +3125,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // drift out of sync.
     debug!("Registering LogsPlugin");
     let logs_dir = config.data_dir.join("logs");
-    let shared_log_storage_config = log_aggregator_storage_config(&config.data_dir)
-        .map_err(|e| anyhow::anyhow!("❌ Log storage configuration is invalid\n\n{e}"))?;
+    let stateless_instance_id = temps_config::stateless_instance_id(db.as_ref()).await?;
+    let shared_log_storage_config =
+        log_aggregator_storage_config(&config.data_dir, stateless_instance_id.as_deref())
+            .map_err(|e| anyhow::anyhow!("❌ Log storage configuration is invalid\n\n{e}"))?;
     let logs_plugin = Box::new(LogsPlugin::new(logs_dir, shared_log_storage_config.clone()));
     plugin_manager.register_plugin(logs_plugin);
 
@@ -3324,7 +3348,22 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // Reuses `shared_log_storage_config`, resolved once above alongside
     // LogsPlugin -- see the comment there for why these two plugins share a
     // single config resolution instead of two independent env-var reads.
-    let log_aggregator_plugin = Box::new(LogAggregatorPlugin::new(shared_log_storage_config));
+    // The ADR-047 line index uses the instance's ClickHouse connection from
+    // `ServerConfig`, exactly like the other ClickHouse-backed stores above;
+    // the plugin never reads the environment itself.
+    let log_line_index_config = if config.is_clickhouse_enabled() {
+        Some(temps_clickhouse::ClickHouseConfig::new(
+            config.clickhouse_url.clone().unwrap_or_default(),
+            config.clickhouse_database.clone().unwrap_or_default(),
+            config.clickhouse_user.clone().unwrap_or_default(),
+            config.clickhouse_password.clone().unwrap_or_default(),
+        ))
+    } else {
+        None
+    };
+    let log_aggregator_plugin = Box::new(
+        LogAggregatorPlugin::new(shared_log_storage_config).with_line_index(log_line_index_config),
+    );
     plugin_manager.register_plugin(log_aggregator_plugin);
 
     // 9.5. ImportPlugin - provides workload import functionality (depends on
@@ -3413,7 +3452,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     // 15. ExternalPluginsPlugin - discovers and manages standalone binary plugins
     debug!("Registering ExternalPluginsPlugin");
-    let external_plugin_config = temps_external_plugins::manager::ExternalPluginConfig::new(
+    let mut external_plugin_config = temps_external_plugins::manager::ExternalPluginConfig::new(
         config.data_dir.clone(),
         config.database_url.clone(),
     )
@@ -3423,6 +3462,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // construct one without being told the address the proxy listens on.
     .with_proxy_address(&config.address)
     .with_registry(external_plugin_registry);
+    external_plugin_config.persistent_installations = !temps_config::installation_mode(db.as_ref())
+        .await?
+        .is_stateless();
     let external_plugins_plugin = Box::new(temps_external_plugins::ExternalPluginsPlugin::new(
         external_plugin_config,
     ));
@@ -4285,6 +4327,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let route_sync_state = Arc::new(temps_routes::route_sync::RouteSyncAppState {
         db: db.clone(),
         peer_table: route_table.clone(),
+        encryption_service: encryption_service.clone(),
+        request_policy_gate: request_policy_gate_slot.clone(),
     });
     let route_sync_routes =
         temps_routes::route_sync::configure_routes().with_state(route_sync_state);
@@ -4596,10 +4640,26 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let shutdown_signal = {
         let svc = external_plugins_service.clone();
         let cloud = cloud_service.clone();
+        // Seal every unsealed log head so a restart never loses the last
+        // minutes of container logs (ADR-046 §1). The WAL covers crashes;
+        // this covers the ordinary upgrade restart.
+        let log_writer = plugin_manager
+            .service_context()
+            .get_service::<temps_log_aggregator::ChunkWriterService>();
         async move {
             let _ = tokio::signal::ctrl_c().await;
             info!("Console API received shutdown signal, stopping background services...");
             join_cloud_enrollment_bootstrap(enrollment_bootstrap).await;
+            if let Some(writer) = log_writer {
+                match tokio::time::timeout(std::time::Duration::from_secs(20), writer.flush_all())
+                    .await
+                {
+                    Ok(()) => info!("Log heads sealed"),
+                    Err(_) => {
+                        warn!("Sealing log heads exceeded 20s; unsealed lines stay in the WAL")
+                    }
+                }
+            }
             if let Some(service) = cloud {
                 service.shutdown().await;
                 info!("Managed telemetry mirror shut down");
@@ -6198,7 +6258,7 @@ mod log_storage_config_tests {
     fn defaults_to_the_filesystem_backend() {
         let _guard = EnvGuard::acquire();
 
-        let config = log_aggregator_storage_config(std::path::Path::new("/srv/temps"))
+        let config = log_aggregator_storage_config(std::path::Path::new("/srv/temps"), None)
             .expect("the filesystem backend needs no configuration");
 
         match config {
@@ -6216,7 +6276,7 @@ mod log_storage_config_tests {
         std::env::set_var("TEMPS_LOG_S3_BUCKET", "temps-logs");
         // TEMPS_LOG_S3_ACCESS_KEY_ID deliberately unset.
 
-        let error = log_aggregator_storage_config(std::path::Path::new("/srv/temps"))
+        let error = log_aggregator_storage_config(std::path::Path::new("/srv/temps"), None)
             .expect_err("an incomplete S3 configuration must be reported");
 
         let rendered = error.to_string();
@@ -6237,7 +6297,7 @@ mod log_storage_config_tests {
         std::env::set_var("TEMPS_LOG_S3_ACCESS_KEY_ID", "key");
         std::env::set_var("TEMPS_LOG_S3_SECRET_ACCESS_KEY", "secret");
 
-        let error = log_aggregator_storage_config(std::path::Path::new("/srv/temps"))
+        let error = log_aggregator_storage_config(std::path::Path::new("/srv/temps"), None)
             .expect_err("a whitespace-only bucket name is not a bucket name");
 
         assert!(error.to_string().contains("TEMPS_LOG_S3_BUCKET"));
@@ -6251,7 +6311,7 @@ mod log_storage_config_tests {
         std::env::set_var("TEMPS_LOG_S3_ACCESS_KEY_ID", "key");
         std::env::set_var("TEMPS_LOG_S3_SECRET_ACCESS_KEY", "secret");
 
-        let config = log_aggregator_storage_config(std::path::Path::new("/srv/temps"))
+        let config = log_aggregator_storage_config(std::path::Path::new("/srv/temps"), None)
             .expect("all required variables are present");
 
         match config {
