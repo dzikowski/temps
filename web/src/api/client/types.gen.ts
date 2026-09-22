@@ -15817,6 +15817,10 @@ export type PlatformFeatures = {
      */
     docker: boolean;
     /**
+     * External plugin binaries and plugin-owned files may be installed.
+     */
+    external_plugins?: boolean;
+    /**
      * Container images can be built by this process. Requires a local Docker
      * daemon; always `false` when `docker` is `false`.
      */
@@ -15841,6 +15845,10 @@ export type PlatformFeatures = {
      */
     managed_services: boolean;
     /**
+     * AI editing workspaces and chat attachments have durable local storage.
+     */
+    persistent_workspaces?: boolean;
+    /**
      * Serve profile this process was started with: `"full"` or
      * `"control-plane"`.
      */
@@ -15850,6 +15858,11 @@ export type PlatformFeatures = {
      * local Docker daemon.
      */
     sandboxes: boolean;
+    /**
+     * This installation uses Postgres, injected secrets and S3 for durable
+     * state; its control-plane scratch disk may be discarded.
+     */
+    stateless?: boolean;
     /**
      * Container image vulnerability scanning is available. Requires a local
      * Docker daemon to pull and scan images.
@@ -26775,6 +26788,7 @@ export type DeployApplicationWorkspaceProjectErrors = {
     401: unknown;
     403: unknown;
     404: unknown;
+    409: unknown;
     413: unknown;
     503: unknown;
 };
@@ -53248,6 +53262,10 @@ export type DeployFromImageUploadErrors = {
      */
     404: unknown;
     /**
+     * Deployment method unavailable in stateless mode
+     */
+    409: unknown;
+    /**
      * Image tarball too large
      */
     413: unknown;
@@ -53333,6 +53351,10 @@ export type DeployFromUploadedSourceErrors = {
      * Project or environment not found
      */
     404: unknown;
+    /**
+     * Deployment method unavailable in stateless mode
+     */
+    409: unknown;
 };
 
 export type DeployFromUploadedSourceResponses = {
@@ -53371,6 +53393,10 @@ export type DeployFromStaticErrors = {
      * Project, environment, or bundle not found
      */
     404: unknown;
+    /**
+     * Deployment method unavailable in stateless mode
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -57618,6 +57644,10 @@ export type UploadStaticBundleErrors = {
      * Project not found
      */
     404: unknown;
+    /**
+     * Deployment method unavailable in stateless mode
+     */
+    409: unknown;
     /**
      * Bundle too large
      */

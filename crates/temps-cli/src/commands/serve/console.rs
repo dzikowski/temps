@@ -1844,6 +1844,9 @@ fn docker_unavailable_error(reason: &str) -> anyhow::Error {
 /// Storage backend selection for the log aggregator.
 #[derive(Debug, thiserror::Error)]
 pub enum LogStorageConfigError {
+    #[error(transparent)]
+    Stateless(#[from] temps_file_store::s3_config::StaticStorageConfigError),
+
     #[error(
         "TEMPS_LOG_STORAGE_BACKEND is set to 's3', but {variable} is not set. Set it (and the \
          other TEMPS_LOG_S3_* variables), or unset TEMPS_LOG_STORAGE_BACKEND to store aggregated \
@@ -1860,12 +1863,31 @@ pub enum LogStorageConfigError {
 /// have failed as well. Returns a typed error the caller renders instead.
 fn log_aggregator_storage_config(
     data_dir: &std::path::Path,
+    stateless_instance_id: Option<&str>,
 ) -> Result<StorageConfig, LogStorageConfigError> {
     fn required(variable: &'static str) -> Result<String, LogStorageConfigError> {
         std::env::var(variable)
             .ok()
             .filter(|value| !value.trim().is_empty())
             .ok_or(LogStorageConfigError::MissingS3Variable { variable })
+    }
+
+    let stateless =
+        temps_file_store::s3_config::resolve_stateless_storage_for(stateless_instance_id)?;
+    if let Some(prefix) = stateless.subsystem_prefix("logs") {
+        if let temps_file_store::s3_config::StaticStorageBackend::S3(storage) =
+            temps_file_store::s3_config::resolve_static_storage_backend_for(&stateless)?
+        {
+            return Ok(StorageConfig::S3 {
+                bucket: storage.bucket,
+                region: storage.region,
+                endpoint: storage.endpoint,
+                access_key_id: storage.access_key_id,
+                secret_access_key: storage.secret_access_key,
+                prefix: Some(prefix),
+                force_path_style: storage.force_path_style,
+            });
+        }
     }
 
     let backend =
@@ -3103,8 +3125,10 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // drift out of sync.
     debug!("Registering LogsPlugin");
     let logs_dir = config.data_dir.join("logs");
-    let shared_log_storage_config = log_aggregator_storage_config(&config.data_dir)
-        .map_err(|e| anyhow::anyhow!("❌ Log storage configuration is invalid\n\n{e}"))?;
+    let stateless_instance_id = temps_config::stateless_instance_id(db.as_ref()).await?;
+    let shared_log_storage_config =
+        log_aggregator_storage_config(&config.data_dir, stateless_instance_id.as_deref())
+            .map_err(|e| anyhow::anyhow!("❌ Log storage configuration is invalid\n\n{e}"))?;
     let logs_plugin = Box::new(LogsPlugin::new(logs_dir, shared_log_storage_config.clone()));
     plugin_manager.register_plugin(logs_plugin);
 
@@ -3428,7 +3452,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     // 15. ExternalPluginsPlugin - discovers and manages standalone binary plugins
     debug!("Registering ExternalPluginsPlugin");
-    let external_plugin_config = temps_external_plugins::manager::ExternalPluginConfig::new(
+    let mut external_plugin_config = temps_external_plugins::manager::ExternalPluginConfig::new(
         config.data_dir.clone(),
         config.database_url.clone(),
     )
@@ -3438,6 +3462,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // construct one without being told the address the proxy listens on.
     .with_proxy_address(&config.address)
     .with_registry(external_plugin_registry);
+    external_plugin_config.persistent_installations = !temps_config::installation_mode(db.as_ref())
+        .await?
+        .is_stateless();
     let external_plugins_plugin = Box::new(temps_external_plugins::ExternalPluginsPlugin::new(
         external_plugin_config,
     ));
@@ -6231,7 +6258,7 @@ mod log_storage_config_tests {
     fn defaults_to_the_filesystem_backend() {
         let _guard = EnvGuard::acquire();
 
-        let config = log_aggregator_storage_config(std::path::Path::new("/srv/temps"))
+        let config = log_aggregator_storage_config(std::path::Path::new("/srv/temps"), None)
             .expect("the filesystem backend needs no configuration");
 
         match config {
@@ -6249,7 +6276,7 @@ mod log_storage_config_tests {
         std::env::set_var("TEMPS_LOG_S3_BUCKET", "temps-logs");
         // TEMPS_LOG_S3_ACCESS_KEY_ID deliberately unset.
 
-        let error = log_aggregator_storage_config(std::path::Path::new("/srv/temps"))
+        let error = log_aggregator_storage_config(std::path::Path::new("/srv/temps"), None)
             .expect_err("an incomplete S3 configuration must be reported");
 
         let rendered = error.to_string();
@@ -6270,7 +6297,7 @@ mod log_storage_config_tests {
         std::env::set_var("TEMPS_LOG_S3_ACCESS_KEY_ID", "key");
         std::env::set_var("TEMPS_LOG_S3_SECRET_ACCESS_KEY", "secret");
 
-        let error = log_aggregator_storage_config(std::path::Path::new("/srv/temps"))
+        let error = log_aggregator_storage_config(std::path::Path::new("/srv/temps"), None)
             .expect_err("a whitespace-only bucket name is not a bucket name");
 
         assert!(error.to_string().contains("TEMPS_LOG_S3_BUCKET"));
@@ -6284,7 +6311,7 @@ mod log_storage_config_tests {
         std::env::set_var("TEMPS_LOG_S3_ACCESS_KEY_ID", "key");
         std::env::set_var("TEMPS_LOG_S3_SECRET_ACCESS_KEY", "secret");
 
-        let config = log_aggregator_storage_config(std::path::Path::new("/srv/temps"))
+        let config = log_aggregator_storage_config(std::path::Path::new("/srv/temps"), None)
             .expect("all required variables are present");
 
         match config {

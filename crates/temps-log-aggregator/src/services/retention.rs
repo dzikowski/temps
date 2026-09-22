@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::error::LogAggregatorError;
 use crate::index::{LineIndexSink, NoLineIndex};
-use crate::services::LogMetadataService;
+use crate::services::{ChunkWriterService, LogMetadataService};
 use crate::store::manifest::ManifestRepo;
 use crate::types::{ChunkMeta, RetentionConfig};
 
@@ -39,6 +39,19 @@ pub struct RetentionService {
     /// ADR-047: rows of expired chunks are forgotten in the line index, and
     /// the index TTL is kept equal to the retention window.
     line_index: Arc<dyn LineIndexSink>,
+    chunk_writer: Option<Arc<ChunkWriterService>>,
+}
+
+fn next_purge_cutoff(
+    previous: Option<DateTime<Utc>>,
+    requested: DateTime<Utc>,
+    chunks_failed: u64,
+) -> Option<DateTime<Utc>> {
+    if chunks_failed > 0 {
+        previous
+    } else {
+        Some(previous.map_or(requested, |cutoff| cutoff.max(requested)))
+    }
 }
 
 impl RetentionService {
@@ -47,7 +60,13 @@ impl RetentionService {
             manifests,
             metadata_service,
             line_index: Arc::new(NoLineIndex::default()),
+            chunk_writer: None,
         }
+    }
+
+    pub fn with_chunk_writer(mut self, chunk_writer: Arc<ChunkWriterService>) -> Self {
+        self.chunk_writer = Some(chunk_writer);
+        self
     }
 
     pub fn with_line_index(mut self, line_index: Arc<dyn LineIndexSink>) -> Self {
@@ -116,8 +135,10 @@ impl RetentionService {
 
     /// Run retention cleanup for a specific project.
     ///
-    /// Deletes chunks older than the configured retention period.
-    /// Storage object is deleted first; metadata row is deleted only after confirmed.
+    /// Tombstones chunks older than the configured retention period so they
+    /// immediately leave search results. Deferred GC removes their objects and
+    /// manifest rows after the reader-safety grace period; index cleanup is
+    /// durably queued and retried by the forget sweeper.
     pub async fn cleanup_project(
         &self,
         project_id: i32,
@@ -163,8 +184,10 @@ impl RetentionService {
 
     /// Manual purge: delete all log data for a project before a given timestamp.
     ///
-    /// Used for GDPR compliance or accidental sensitive data logging.
-    /// Deletes both S3 chunks and log_events rows within the time range.
+    /// Used for GDPR compliance or accidental sensitive data logging. Matching
+    /// manifests are tombstoned so their lines immediately leave search;
+    /// object deletion and index cleanup follow through the same deferred GC
+    /// and durable forget queue as scheduled retention.
     pub async fn manual_purge(
         &self,
         project_id: i32,
@@ -176,12 +199,27 @@ impl RetentionService {
             "Starting manual purge"
         );
 
+        // Search includes the writer's unsealed heads. Seal them before
+        // selecting manifests so a successful purge cannot leave live-tail
+        // lines visible with synthetic HEAD_LINE_ID_BASE identifiers.
+        let mut project_purge_guard = if let Some(writer) = &self.chunk_writer {
+            let guard = writer.lock_project_for_purge(project_id).await;
+            writer.flush_project_for_purge(project_id).await?;
+            Some(guard)
+        } else {
+            None
+        };
+
         let chunks = self
             .metadata_service
             .find_expired_chunks(project_id, before)
             .await?;
 
         let (deleted, failed, bytes) = self.tombstone(&chunks).await;
+
+        if let Some(guard) = project_purge_guard.as_mut() {
+            **guard = next_purge_cutoff(**guard, before, failed);
+        }
 
         info!(
             project_id = %project_id,
@@ -196,5 +234,26 @@ impl RetentionService {
             chunks_failed: failed,
             bytes_reclaimed: bytes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_purge_cutoff;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn partial_tombstone_failure_does_not_advance_delayed_ingest_cutoff() {
+        let previous = Utc::now() - Duration::hours(2);
+        let requested = Utc::now();
+        assert_eq!(next_purge_cutoff(None, requested, 1), None);
+        assert_eq!(
+            next_purge_cutoff(Some(previous), requested, 1),
+            Some(previous)
+        );
+        assert_eq!(
+            next_purge_cutoff(Some(previous), requested, 0),
+            Some(requested)
+        );
     }
 }

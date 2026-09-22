@@ -170,15 +170,20 @@ impl TempsPlugin for DeploymentsPlugin {
             context.register_service(remote_log_source);
 
             // Cancel any running deployments from previous server instance
-            let cancel_service = deployment_service.clone();
-            tokio::spawn(async move {
-                if let Err(e) = cancel_service
-                    .cancel_running_deployments("Server restarted")
-                    .await
-                {
-                    tracing::error!("Failed to cancel running deployments: {}", e);
-                }
-            });
+            // Complete restart reconciliation before the durable queue consumer
+            // starts. Spawning this used to race a replayed deployment: the new
+            // workflow could transition to running and then be cancelled by the
+            // predecessor cleanup task.
+            deployment_service
+                .cancel_running_deployments(
+                    crate::services::job_processor::SERVER_RESTART_CANCELLED_REASON,
+                )
+                .await
+                .map_err(|error| {
+                    PluginError::InitializationFailed(format!(
+                        "failed to reconcile running deployments before queue startup: {error}"
+                    ))
+                })?;
 
             // Get encryption service for deployment token encryption (needed by cron service and workflow planner)
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
@@ -226,13 +231,27 @@ impl TempsPlugin for DeploymentsPlugin {
             // the same `FsFileStore` under `TEMPS_DATA_DIR/cas` as before this change.
             // No byte cache here: caching only matters for the proxy's *read* path
             // (see `temps-proxy/src/server.rs`), never for these write-side uses.
-            let cas_file_store: Arc<dyn temps_file_store::FileStore> =
-                match temps_file_store::s3_config::resolve_static_storage_backend().map_err(
-                    |error| PluginError::PluginRegistrationFailed {
+            let instance_id = config_service
+                .stateless_instance_id()
+                .await
+                .map_err(|error| PluginError::PluginRegistrationFailed {
+                    plugin_name: "deployments".to_string(),
+                    error: format!("Could not read persisted installation mode: {error}"),
+                })?;
+            let stateless_storage =
+                temps_file_store::s3_config::resolve_stateless_storage_for(instance_id.as_deref())
+                    .map_err(|error| PluginError::PluginRegistrationFailed {
                         plugin_name: "deployments".to_string(),
-                        error: format!("❌ CAS asset store configuration is invalid\n\n{error}"),
-                    },
-                )? {
+                        error: error.to_string(),
+                    })?;
+            let cas_file_store: Arc<dyn temps_file_store::FileStore> =
+                match temps_file_store::s3_config::resolve_static_storage_backend_for(
+                    &stateless_storage,
+                )
+                .map_err(|error| PluginError::PluginRegistrationFailed {
+                    plugin_name: "deployments".to_string(),
+                    error: format!("❌ CAS asset store configuration is invalid\n\n{error}"),
+                })? {
                     temps_file_store::s3_config::StaticStorageBackend::Filesystem => {
                         let cas_dir = config_service.data_dir().join("cas");
                         Arc::new(temps_file_store::fs_store::FsFileStore::new(cas_dir))
@@ -402,7 +421,7 @@ impl TempsPlugin for DeploymentsPlugin {
             let dsn_service = context.require_service::<temps_error_tracking::DSNService>();
 
             // Create JobProcessor with workflow execution capability
-            let job_receiver = queue_service.subscribe();
+            let job_receiver = queue_service.subscribe_durable(temps_queue::DEPLOYMENT_CONSUMER);
             let workflow_planner = Arc::new(WorkflowPlanner::new(
                 db.clone(),
                 log_service.clone(),
@@ -484,6 +503,14 @@ impl TempsPlugin for DeploymentsPlugin {
                 workflow_execution_service.clone(),
                 queue_service.clone(),
                 deployment_gate,
+                config_service
+                    .is_stateless_installation()
+                    .await
+                    .map_err(|error| {
+                        PluginError::InitializationFailed(format!(
+                        "could not resolve stateless configuration for source Drop service: {error}"
+                    ))
+                    })?,
             ));
             context.register_service(source_drop_service.clone());
             let source_drop_deployer =

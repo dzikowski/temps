@@ -811,6 +811,7 @@ mod tests {
     use axum::middleware;
     use axum_test::TestServer;
     use chrono::{Duration, Utc};
+    use sea_orm::ConnectionTrait;
     use std::sync::Arc;
     use temps_database::test_utils::TestDatabase;
     use uuid::Uuid;
@@ -822,7 +823,7 @@ mod tests {
         ChunkWriterService, LogMetadataService, LogSearchService, RetentionService, TailService,
     };
     use crate::storage::FilesystemStorage;
-    use crate::store::chunk_store::{ChunkStore, NoHeads};
+    use crate::store::chunk_store::ChunkStore;
     use crate::store::manifest::ManifestRepo;
     use crate::store::LogLineStore;
     use crate::types::{LogLevel, LogLine, LogStream};
@@ -875,22 +876,6 @@ mod tests {
         let cache = ChunkCache::open(None, 64 * 1024 * 1024)
             .await
             .expect("Failed to open chunk cache");
-        let store: Arc<dyn LogLineStore> = Arc::new(ChunkStore::new(
-            ManifestRepo::new(db.connection_arc()),
-            storage.clone(),
-            cache,
-            Arc::new(NoHeads),
-        ));
-        let search_service = Arc::new(LogSearchService::new(
-            store.clone(),
-            metadata_service.clone(),
-        ));
-        let (tail_tx, _) = tokio::sync::broadcast::channel::<LogLine>(1024);
-        let tail_service = Arc::new(TailService::new(tail_tx.clone()));
-        let retention_service = Arc::new(RetentionService::new(
-            Arc::new(ManifestRepo::new(db.connection_arc())),
-            metadata_service.clone(),
-        ));
         let chunk_writer = ChunkWriterService::open(
             storage.clone(),
             Arc::new(ManifestRepo::new(db.connection_arc())),
@@ -899,6 +884,25 @@ mod tests {
         )
         .await
         .expect("Failed to open chunk writer");
+        let store: Arc<dyn LogLineStore> = Arc::new(ChunkStore::new(
+            ManifestRepo::new(db.connection_arc()),
+            storage.clone(),
+            cache,
+            chunk_writer.clone(),
+        ));
+        let search_service = Arc::new(LogSearchService::new(
+            store.clone(),
+            metadata_service.clone(),
+        ));
+        let (tail_tx, _) = tokio::sync::broadcast::channel::<LogLine>(1024);
+        let tail_service = Arc::new(TailService::new(tail_tx.clone()));
+        let retention_service = Arc::new(
+            RetentionService::new(
+                Arc::new(ManifestRepo::new(db.connection_arc())),
+                metadata_service.clone(),
+            )
+            .with_chunk_writer(chunk_writer.clone()),
+        );
         let audit_service = Arc::new(MockAuditLogger) as Arc<dyn temps_core::AuditLogger>;
 
         let app_state = Arc::new(LogAggregatorAppState {
@@ -1100,9 +1104,36 @@ mod tests {
                 "container-1",
             ),
         ];
-        seed_logs(&ctx, lines).await;
+        // Leave these lines in the live head buffer. Search exposes heads with
+        // synthetic line IDs, which is the production path that previously
+        // survived a successful purge until the normal age-based seal.
+        for line in lines {
+            ctx.chunk_writer
+                .write_line(line)
+                .await
+                .expect("write live head line");
+        }
 
         let server = build_test_server(ctx.app_state.clone());
+
+        let before_purge = server
+            .post("/logs/search")
+            .json(&serde_json::json!({
+                "project_id": project_id,
+                "start_time": (now - Duration::hours(3)).to_rfc3339(),
+                "end_time": (now + Duration::hours(1)).to_rfc3339(),
+            }))
+            .await;
+        let before_body: serde_json::Value = before_purge.json();
+        assert_eq!(before_body["lines"].as_array().map(Vec::len), Some(2));
+        assert!(before_body["lines"]
+            .as_array()
+            .expect("lines")
+            .iter()
+            .all(|line| line["line_id"]
+                .as_str()
+                .and_then(|value| value.parse::<i64>().ok())
+                .is_some_and(|line_id| line_id >= crate::store::HEAD_LINE_ID_BASE)));
 
         let response = server
             .post("/logs/search")
@@ -1523,6 +1554,80 @@ mod tests {
             "Expected no logs after purge, found {}",
             remaining_lines.len()
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_tombstone_keeps_cutoff_open_for_delayed_ingest() {
+        let ctx = create_test_context().await;
+        let project_id = next_test_project_id();
+        let now = Utc::now();
+        ctx.chunk_writer
+            .write_line(make_log_line(
+                project_id,
+                "api",
+                "prod",
+                LogLevel::Error,
+                "original sensitive line",
+                now - Duration::hours(2),
+                "container-failed-purge",
+            ))
+            .await
+            .expect("write original head");
+
+        ctx._db
+            .db
+            .execute_unprepared(
+                "CREATE FUNCTION reject_log_chunk_tombstone() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected tombstone failure'; END $$; \
+                 CREATE TRIGGER reject_log_chunk_tombstone BEFORE UPDATE OF deleted_at ON log_chunks FOR EACH ROW EXECUTE FUNCTION reject_log_chunk_tombstone();",
+            )
+            .await
+            .expect("install tombstone failure trigger");
+
+        let server = build_test_server(ctx.app_state.clone());
+        let response = server
+            .delete(&format!("/projects/{project_id}/logs"))
+            .json(&serde_json::json!({ "before": now.to_rfc3339() }))
+            .await;
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["chunks_deleted"].as_u64(), Some(0));
+        assert_eq!(body["chunks_failed"].as_u64(), Some(1));
+
+        // Docker may deliver a buffered line after the failed purge returns.
+        // It must remain accepted because the destructive boundary did not
+        // commit every selected manifest.
+        ctx.chunk_writer
+            .write_line(make_log_line(
+                project_id,
+                "api",
+                "prod",
+                LogLevel::Info,
+                "delayed line after failed purge",
+                now - Duration::hours(1),
+                "container-delayed-after-failure",
+            ))
+            .await
+            .expect("failed purge must not suppress delayed ingest");
+
+        let search = server
+            .post("/logs/search")
+            .json(&serde_json::json!({
+                "project_id": project_id,
+                "start_time": (now - Duration::hours(3)).to_rfc3339(),
+                "end_time": (now + Duration::hours(1)).to_rfc3339(),
+            }))
+            .await;
+        assert_eq!(search.status_code(), StatusCode::OK);
+        let search_body: serde_json::Value = search.json();
+        let messages: Vec<&str> = search_body["lines"]
+            .as_array()
+            .expect("search lines")
+            .iter()
+            .filter_map(|line| line["message"].as_str())
+            .collect();
+        assert!(messages.contains(&"original sensitive line"));
+        assert!(messages.contains(&"delayed line after failed purge"));
     }
 
     #[tokio::test]

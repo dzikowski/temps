@@ -9,6 +9,7 @@ pub(crate) mod on_demand_cert;
 pub(crate) mod proxy;
 pub(crate) mod self_update;
 mod shutdown;
+pub(crate) mod stateless;
 
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
@@ -32,6 +33,29 @@ fn next_post_migration_index_retry(current: std::time::Duration) -> std::time::D
     current
         .saturating_mul(2)
         .min(POST_MIGRATION_INDEX_MAX_RETRY)
+}
+
+#[derive(Debug, thiserror::Error)]
+enum LocalStartupMigrationError {
+    #[error(transparent)]
+    InstallationMode(#[from] stateless::StatelessStartupError),
+    #[error(
+        "Local startup database migration failed after installation-mode validation: {source}"
+    )]
+    Migration {
+        #[source]
+        source: temps_core::ServiceError,
+    },
+}
+
+async fn run_local_mode_migrations(
+    db: &sea_orm::DatabaseConnection,
+) -> Result<(), LocalStartupMigrationError> {
+    stateless::reject_local_mode_for_managed_database(db).await?;
+    temps_database::run_migrations(db)
+        .await
+        .map_err(|source| LocalStartupMigrationError::Migration { source })?;
+    Ok(())
 }
 
 /// Which halves of the control plane this `temps serve` process runs.
@@ -296,8 +320,71 @@ impl ServeCommand {
         // leave both stranded -- the maintenance task unpolled and the pooled
         // sockets bound to a driver nothing runs -- and the first query issued
         // from the main runtime would hang forever.
+        // Declare the owner before the runtime so the runtime (including all
+        // detached plugin tasks) shuts down before the ownership guard drops.
+        let _control_plane_owner;
         let rt = tokio::runtime::Runtime::new()?;
-        let db = rt.block_on(temps_database::establish_connection(&self.database_url))?;
+        let bootstrap_stateless = temps_config::bootstrap_stateless_requested()?;
+        _control_plane_owner = if bootstrap_stateless {
+            stateless::validate_profile(self.profile, self.role)?;
+            stateless::validate_scratch_directory(&serve_config.data_dir)?;
+            Some(rt.block_on(stateless::ControlPlaneOwner::acquire(&self.database_url))?)
+        } else {
+            None
+        };
+        let db = rt.block_on(temps_database::connect_without_migrations(
+            &self.database_url,
+        ))?;
+        let persisted_mode = rt.block_on(temps_config::installation_mode(db.as_ref()))?;
+        if persisted_mode.is_stateless() && !bootstrap_stateless {
+            rt.block_on(stateless::reject_local_mode_for_managed_database(
+                db.as_ref(),
+            ))?;
+        }
+        let stateless_mode = bootstrap_stateless || persisted_mode.is_stateless();
+        let storage_identity = if stateless_mode {
+            Some(stateless::storage_identity()?)
+        } else {
+            None
+        };
+        if stateless_mode {
+            rt.block_on(stateless::preflight_identity(
+                db.as_ref(),
+                serve_config.as_ref(),
+                encryption_service.as_ref(),
+                storage_identity
+                    .as_ref()
+                    .map(|(instance, storage)| (instance.as_str(), storage.as_str())),
+            ))?;
+            rt.block_on(stateless::prepare_storage())?;
+            rt.block_on(temps_database::run_migrations(db.as_ref()))?;
+        } else {
+            // This guard must remain before every migration and startup write.
+            // A local process pointed at a stateless-bound database must leave
+            // even pending schema/data migrations untouched when it refuses to
+            // start.
+            rt.block_on(run_local_mode_migrations(db.as_ref()))?;
+        }
+        if let Some((instance_id, storage_identity)) = storage_identity {
+            rt.block_on(stateless::verify_identity(
+                db.clone(),
+                serve_config.clone(),
+                encryption_service.as_ref(),
+                &instance_id,
+                &storage_identity,
+            ))?;
+        }
+        // From this point onward runtime behavior follows only the durable
+        // database binding. The environment value above was consumed solely
+        // to bootstrap or authenticate adoption/replacement.
+        let stateless_mode = rt
+            .block_on(temps_config::installation_mode(db.as_ref()))?
+            .is_stateless();
+        if bootstrap_stateless && !stateless_mode {
+            anyhow::bail!(
+                "Stateless bootstrap completed without a persisted installation identity"
+            );
+        }
 
         // Update private address setting from CLI flag
         if let Some(ref private_address) = self.private_address {
@@ -355,8 +442,16 @@ impl ServeCommand {
 
         // Create the shared job queue FIRST — it is used by route table listeners
         // (to publish RouteTableUpdated) and by the console API (for all other jobs).
-        let (queue, _keep_alive_receiver): (Arc<dyn temps_core::JobQueue>, _) =
-            temps_queue::BroadcastQueueService::create_job_queue_arc_with_receiver(1000);
+        let (queue, _keep_alive_receiver): (Arc<dyn temps_core::JobQueue>, _) = if stateless_mode {
+            (
+                rt.block_on(temps_queue::DurableBroadcastQueue::create(db.clone(), 1000))?,
+                None,
+            )
+        } else {
+            let (queue, receiver) =
+                temps_queue::BroadcastQueueService::create_job_queue_arc_with_receiver(1000);
+            (queue, Some(receiver))
+        };
 
         // Create shared route table instance (used by both console API and proxy)
         let route_table = Arc::new(temps_proxy::CachedPeerTable::new_with_runtime_context(
@@ -1053,6 +1148,7 @@ mod serve_profile_tests {
 #[cfg(test)]
 mod post_migration_tests {
     use super::*;
+    use sea_orm::ConnectionTrait;
 
     #[test]
     fn index_retry_backoff_grows_and_caps() {
@@ -1061,5 +1157,82 @@ mod post_migration_tests {
             delay = next_post_migration_index_retry(delay);
             assert_eq!(delay, std::time::Duration::from_secs(expected));
         }
+    }
+
+    #[tokio::test]
+    async fn local_startup_rejects_bound_database_before_pending_migration() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!(
+                    "Skipping startup identity integration test: Docker unavailable: {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("startup identity test database failed: {error}"),
+        };
+        let db = database.db.as_ref();
+        const STATELESS_MIGRATION: &str = "m20260922_000001_stateless_control_plane_jobs";
+
+        db.execute_unprepared(
+            "INSERT INTO stateless_control_plane \
+             (id, instance_id, management_url, storage_identity, secret_verifier) \
+             VALUES (1, 'bound-instance', 'https://console.example.test', \
+             'bound-storage', 'bound-verifier')",
+        )
+        .await
+        .expect("persist stateless installation binding");
+        db.execute_unprepared(&format!(
+            "DELETE FROM seaql_migrations WHERE version = '{STATELESS_MIGRATION}'"
+        ))
+        .await
+        .expect("mark the stateless migration pending without removing its binding");
+
+        let error = run_local_mode_migrations(db)
+            .await
+            .expect_err("local startup must reject a stateless-bound database");
+        assert!(matches!(
+            error,
+            LocalStartupMigrationError::InstallationMode(
+                stateless::StatelessStartupError::Configuration { ref detail }
+            ) if detail.contains("TEMPS_STATELESS=true")
+        ));
+        assert!(
+            temps_database::get_pending_migration_names(db)
+                .await
+                .expect("read pending migrations after rejection")
+                .iter()
+                .any(|name| name == STATELESS_MIGRATION),
+            "the rejected startup must not apply its pending migration"
+        );
+
+        // Model a legitimate database from before the stateless identity
+        // migration existed. The same guarded local startup must accept the
+        // absent table and apply the pending migration normally.
+        db.execute_unprepared(
+            "DROP TABLE durable_job_deliveries; \
+             DROP TABLE durable_jobs; \
+             DROP TABLE stateless_cloud_backfill_checkpoints; \
+             DROP TABLE stateless_cloud_link_state; \
+             DROP TABLE stateless_control_plane;",
+        )
+        .await
+        .expect("restore the pre-identity schema");
+
+        run_local_mode_migrations(db)
+            .await
+            .expect("fresh local startup should apply migrations");
+        assert!(
+            !temps_database::get_pending_migration_names(db)
+                .await
+                .expect("read pending migrations after startup")
+                .iter()
+                .any(|name| name == STATELESS_MIGRATION),
+            "legitimate local startup should apply the pending identity migration"
+        );
     }
 }
